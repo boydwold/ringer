@@ -161,6 +161,7 @@ the check's failure output.
   something that would catch a lazy or hallucinated result.
 - **`expect_files` is a floor, not the check.** List deliverables there for
   fast triage, but the check must still validate them.
+- **Verify a grep hit or a green check by reading what the code does, before it becomes a claim.** Ask two questions every time: *could this check have failed?* and *am I looking where the answer actually lives?* Nine wrong conclusions in one session (2026-07-30) all came from skipping them — `429` matched inside a timestamp; `stall` inside `install`; a `sleep(10)` that was text inside a string literal written out to a fake worker; a filename that only appeared in my own comment; `/api/v1/models`, which answers a **fake** key, used to "prove" a credential valid; `zsh -lic` inheriting the very variable it was testing for; a test asserting on stdout when the verdict lives in the run record. Each check was seconds. Two produced recommendations that were wrong on the merits.
 - **Never `true`, `exit 0`, or `echo done`.** A check that cannot fail is a
   task that cannot be verified — that's just trusting the worker with extra
   steps.
