@@ -27,6 +27,10 @@ EXCLUDED_AUTHORS = {
     "jonathan edwards",
     "nate jones",
     "github",
+    # FORK-ONLY (boydwold/ringer). On a fork the owner is the maintainer, not a
+    # community contributor, so this audit fires on every local commit. Upstream
+    # DOES owe credit for merged work — never send this line in a PR.
+    "boyd wold",
 }
 EXCLUDED_AUTHOR_PREFIXES = ("claude",)
 EXCLUDED_HANDLES = {
