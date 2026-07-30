@@ -316,6 +316,51 @@ And on your own side of the fence: when integrating patches into the real
 repo, stage specific paths — never `git add -A` in a checkout that may hold
 someone's untracked scratch files.
 
+## While a run is live: watch for silence, don't poll
+
+**Ringer has no heartbeat.** There is no liveness, watchdog, or stall detection —
+the only bound is `timeout_s` (default 900s), a hard wall-clock kill. So a worker
+producing nothing for fifteen minutes and a worker working hard for fifteen
+minutes look **identical**, and a crashed worker leaves its record stuck at
+`running` forever. A 58-minute silent stall happened on a real build; the only
+reliable answer to "is anything actually running?" is `pgrep -f 'codex|opencode'`.
+
+**Never `sleep N; tail <log>`.** Blind polling burns your turns, tells you nothing
+between checks, and is what the absence of a signal tempts you into.
+
+**Watch log mtime instead, in the background.** `_tee_stream` writes and
+**flushes** worker stdout to `<taskdir>/worker.log` on every 4096-byte chunk — no
+buffering — so mtime is a fine-grained progress signal you already have. Arm this
+with `Bash` and `run_in_background: true`, then keep working. It exits, and
+notifies you once, the moment a task goes quiet or the run ends:
+
+```bash
+WD=<workdir>; QUIET=180        # seconds of silence that means "look at this"
+while :; do
+  pgrep -f 'ringer.py run' >/dev/null || { echo "run exited"; break; }
+  now=$(date +%s); stalled=""
+  for f in "$WD"/logs/*.log; do
+    [ -f "$f" ] || continue
+    age=$(( now - $(stat -f %m "$f") ))
+    [ "$age" -gt "$QUIET" ] && stalled="$stalled $(basename "$f" .log):${age}s"
+  done
+  [ -n "$stalled" ] && { echo "QUIET >${QUIET}s:$stalled"; break; }
+  sleep 30
+done
+```
+
+Use `run_in_background`, **not** `Monitor`: this is one notification when a
+condition becomes true, and `Monitor` is for a stream of recurring events — it
+would stay armed after the event fired.
+
+Silence is not proof of death. A long compile or a big `uv sync` is legitimately
+quiet. When it fires, read the log tail and decide — do not reflexively kill.
+
+**If you do kill a run, its record stays frozen at `retrying` or `running`
+forever.** Nothing writes a terminal status. So say plainly that you killed it,
+re-run the check by hand, and paste the output — the run artifact no longer
+describes what happened.
+
 ## Post-run review ritual
 
 1. Read the run JSON in `~/.ringer/runs/` — statuses, retries, durations.
