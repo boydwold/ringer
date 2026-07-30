@@ -1633,6 +1633,11 @@ class TaskSpec:
     engine: str = DEFAULT_ENGINE_NAME
     expect_files: tuple[str, ...] = ()
     timeout_s: int = DEFAULT_TIMEOUT_S
+    # Seconds this task's CHECK may run. Separate from timeout_s, which bounds
+    # the worker. Without a per-task value every check shares one global cap, so
+    # a check that runs a test suite or re-executes a probe is killed mid-way and
+    # its task recorded FAILED — throwing away a finished, correct deliverable.
+    check_timeout_s: int = CHECK_TIMEOUT_S
     max_attempts: int = 2
     redact_spec: bool = False
     full_access: bool = False
@@ -1670,6 +1675,9 @@ class TaskSpec:
         timeout_s = int(obj.get("timeout_s", DEFAULT_TIMEOUT_S))
         if timeout_s <= 0:
             raise ValueError(f"task {key}: timeout_s must be positive")
+        check_timeout_s = int(obj.get("check_timeout_s", CHECK_TIMEOUT_S))
+        if check_timeout_s <= 0:
+            raise ValueError(f"task {key}: check_timeout_s must be positive")
         # Strict on the fields this release introduces: `1.5` silently
         # truncating to 1 would remove the retry without saying so, and a
         # string is never what the author meant.
@@ -1701,6 +1709,7 @@ class TaskSpec:
             engine=engine,
             expect_files=tuple(str(item) for item in expect_files),
             timeout_s=timeout_s,
+            check_timeout_s=check_timeout_s,
             max_attempts=max_attempts,
             redact_spec=require_bool(obj.get("redact_spec", False), key, "redact_spec"),
             full_access=bool(obj.get("full_access", False)),
@@ -3033,27 +3042,53 @@ def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
     )
 
 
+def normalise_model_slug(slug: str) -> str:
+    """Strip a harness prefix so log ids and catalog ids compare equal.
+
+    The model log records `openrouter/z-ai/glm-5.2` (harness prefix included);
+    the catalog records `z-ai/glm-5.2`. Comparing them raw means no OpenRouter
+    model is EVER excluded from the candidate list, however many times it has
+    been run — so `--explore` keeps recommending models already recorded as
+    failures, and a model can appear in TIERS and CANDIDATES in the same output.
+    """
+    s = str(slug or "").strip()
+    return s.split("/", 1)[1] if s.startswith("openrouter/") else s
+
+
 def catalog_explore_candidates(
     catalog_models: list[dict[str, Any]],
     *,
     tested_models: set[str],
     limit: int = 10,
+    priced_slots: int = 4,
 ) -> list[dict[str, Any]]:
+    """Untested text candidates: mostly free, but always some priced ones.
+
+    Sorting purely by ascending price and taking the first N means free models
+    fill every slot, so the whole $0.05-$0.60 band is invisible — including the
+    most-used coding models on OpenRouter. Reserve `priced_slots` for models that
+    cost something so the ladder can actually reach them.
+    """
+    tested = {normalise_model_slug(m) for m in tested_models}
+    reserved = {normalise_model_slug(m) for m in RESERVED_FIXTURE_MODELS}
     candidates = [
         model
         for model in catalog_models
-        if str(model.get("id", "")).strip() not in tested_models
-        and str(model.get("id", "")).strip() not in RESERVED_FIXTURE_MODELS
+        if normalise_model_slug(model.get("id", "")) not in tested
+        and normalise_model_slug(model.get("id", "")) not in reserved
         and catalog_model_is_text_candidate(model)
     ]
-    return sorted(
-        candidates,
-        key=lambda model: (
-            not bool(model.get("free")),
-            float(model.get("prompt_per_m") or 0) + float(model.get("completion_per_m") or 0),
-            str(model.get("id") or ""),
-        ),
-    )[:limit]
+    price = lambda m: float(m.get("prompt_per_m") or 0) + float(m.get("completion_per_m") or 0)
+    by_price = lambda m: (price(m), str(m.get("id") or ""))
+    free = sorted([m for m in candidates if m.get("free")], key=by_price)
+    paid = sorted([m for m in candidates if not m.get("free")], key=by_price)
+    take_paid = min(priced_slots, limit, len(paid))
+    picked = free[: max(0, limit - take_paid)] + paid[:take_paid]
+    # Backfill if one side ran short, so `limit` is still honoured.
+    if len(picked) < limit:
+        rest = [m for m in free + paid if m not in picked]
+        picked += sorted(rest, key=by_price)[: limit - len(picked)]
+    return sorted(picked, key=lambda m: (not bool(m.get("free")), by_price(m)))
 
 
 def print_model_explore(
@@ -8607,7 +8642,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
 
 class Verifier:
     async def verify(self, task: TaskSpec, taskdir: Path) -> VerifyResult:
-        check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
+        check_returncode, check_timed_out, output = await self._run_check(
+            task.check, taskdir, task.check_timeout_s
+        )
         missing_files = tuple(
             rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
         )
@@ -8645,7 +8682,15 @@ class Verifier:
         return candidate if candidate.is_absolute() else taskdir / candidate
 
     @staticmethod
-    async def _run_check(command: str, cwd: Path) -> tuple[int | None, bool, str]:
+    async def _run_check(
+        command: str, cwd: Path, timeout_s: int | None = None
+    ) -> tuple[int | None, bool, str]:
+        # Resolve the module global at CALL time, not as a default argument.
+        # A default is bound once when the function is defined, so
+        # `ringer.CHECK_TIMEOUT_S = 1` would be silently ignored — which is both a
+        # trap for callers and exactly what the existing test asserts against.
+        if timeout_s is None:
+            timeout_s = CHECK_TIMEOUT_S
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
@@ -8656,7 +8701,7 @@ class Verifier:
         )
         timed_out = False
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CHECK_TIMEOUT_S)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             timed_out = True
             terminate_process_group(proc)
@@ -8667,7 +8712,11 @@ class Verifier:
                 stdout, _ = await proc.communicate()
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
-            output += f"\n[ringer.py] check timed out after {CHECK_TIMEOUT_S}s\n"
+            output += (
+                f"\n[ringer.py] check timed out after {timeout_s}s"
+                " — raise this task's check_timeout_s, or move the slow work into"
+                " the worker and have the check verify its recorded output.\n"
+            )
         return proc.returncode, timed_out, output
 
 
