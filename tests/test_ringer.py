@@ -13,6 +13,15 @@ import unittest
 from pathlib import Path
 
 
+def setUpModule() -> None:
+    # Slow tier: this module spawns real subprocesses (that is the point — you
+    # cannot unit-test signal handling or process-group cleanup). Set
+    # RINGER_FAST_TESTS=1 to skip it while iterating; CI leaves it unset and
+    # runs everything. See tests/TESTING.md.
+    if os.environ.get("RINGER_FAST_TESTS") == "1":
+        raise unittest.SkipTest("slow tier: spawns real processes (RINGER_FAST_TESTS=1)")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 RINGER_PATH = ROOT / "ringer.py"
 SPEC = importlib.util.spec_from_file_location("ringer_module", RINGER_PATH)

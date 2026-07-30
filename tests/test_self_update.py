@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,15 @@ from ringer import (  # noqa: E402
     perform_self_update,
     self_update_state_path,
 )
+
+
+def setUpModule() -> None:
+    # Slow tier: this module spawns real subprocesses (that is the point — you
+    # cannot unit-test signal handling or process-group cleanup). Set
+    # RINGER_FAST_TESTS=1 to skip it while iterating; CI leaves it unset and
+    # runs everything. See tests/TESTING.md.
+    if os.environ.get("RINGER_FAST_TESTS") == "1":
+        raise unittest.SkipTest("slow tier: spawns real processes (RINGER_FAST_TESTS=1)")
 
 
 class SelfUpdateTests(unittest.TestCase):
