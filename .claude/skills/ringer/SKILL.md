@@ -172,6 +172,27 @@ the check's failure output.
   case-insensitive and flexible matching for structure, and reserve hard
   failure for substance: missing evidence, fabricated content, code that
   doesn't run.
+- **A deliverable the worker only PRINTS does not exist.** If a task must
+  produce `probe.out`, the spec has to say how it gets written — `python3
+  probe.py | tee probe.out`, or a probe that opens the file itself. A worker
+  told "produce probe.out" will happily run the probe, let stdout scroll into
+  `worker.log`, and stop. Real case (2026-07-30, pr443 blast-area): 702KB of
+  correct probe output sat in the log, `probe.out` was never created, and
+  `report.md` was never written even though the worker had 38 of its 50
+  minutes left. The lane read as a total failure; the analysis was actually
+  done and correct.
+- **Name every deliverable in the SPEC's output contract, not just in
+  `expect_files`.** `expect_files` is checked after the worker exits — too
+  late to change what it does. The spec is the only thing that can.
+- **Never put a check script or manifest in `~/tmp`.** That is scratch you must
+  be able to empty; a check that disappears fails every lane at once. Keep them
+  beside the run's other materials — `~/ai-workspaces/_artifacts/work/<date>-<slug>/`.
+- **A `timeout=` inside your own check script is a lie above 60s.**
+  `CHECK_TIMEOUT_S = 60` (`ringer.py:55`) is global and not per-task, so Ringer
+  kills the whole check at 60 seconds no matter what your script allows. A
+  `subprocess.run(..., timeout=2700)` inside a check will never be reached.
+  Either keep the check under a minute or move the slow part into the worker
+  and have the check verify its recorded output.
 
 ## Pattern playbook
 
