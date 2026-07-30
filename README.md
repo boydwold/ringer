@@ -88,6 +88,8 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 
 > **Write checks that print why they fail.** A silent `exit 1` (the `git diff --quiet` style) costs you twice: the retry prompt gets no failure context to fix against, and the eval log records an undiagnosable row. `diff` beats `diff -q`; an assert with a message beats a bare test.
 
+> **Checks are killed at 60 seconds** (`CHECK_TIMEOUT_S`), and the kill is recorded as a task FAILURE — a finished, correct deliverable gets thrown away. That cap is global; a longer timeout passed to your own check script cannot raise it. So a check must never run a full test suite, a build, or a trial merge. Have the worker TEE expensive output to a log file and have the check re-assert the cheap facts plus grep that log for the exact numbers the report claims.
+
 **Identity**: runs are stamped with an orchestrator identity (shown in Ringside and eval rows). Resolution order: `--identity` > `FLEET_IDENTITY`/`RINGER_IDENTITY` env > a `.fleet-agent` file found walking up from the working directory (drop one in a repo root to give that repo's swarms their own name) > `identity_default` in config > short hostname.
 
 ### Manifest fields
