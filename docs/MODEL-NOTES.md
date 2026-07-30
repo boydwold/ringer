@@ -148,6 +148,29 @@ checks and raw logs support — no vibes, no worker self-reports.
   read paths) plus an empirical XSS all-clear on the new DOM surfaces.
   Third proven-tier structured review today.
 
+## kimi-k3 (`openrouter/moonshotai/kimi-k3`) — DEMOTED for code-review
+
+**Do not route review lanes here. Use codex.** Recorded so the next orchestrator
+does not re-run this experiment.
+
+The scoreboard argues for it and the scoreboard is not wrong — it is incomplete.
+Over 37 code-review tasks it reached 0.73 first-try, which clears the `proven`
+bar. Two things the numbers do not carry:
+
+- **It loses whole lanes to OpenRouter 429s, and the loss is invisible.** A
+  `rate_limit_exceeded` burned both attempts of a review lane and produced no
+  report. Ringer has no 429 or backoff handling at all, so a rate limit is
+  treated as an ordinary task failure and the immediate retry hits the same
+  limit. Worse, the 429 never reached the attempt log, so the scoreboard cannot
+  learn this happened — it just silently shows one fewer lane.
+- **Cost.** At $3.00 in / $15.00 out per million it is roughly 4x the input and
+  7x the output of the cheap-intelligence lane, and codex reached 0.92 first-try
+  over 234 code-review tasks on a flat plan. Paying 7x for a lower rate is only
+  defensible if you specifically need a different model family in the panel.
+
+Keep it available for deliberate model diversity — a bakeoff, or a second
+opinion where a distinct lineage is the point. Not as a default review lane.
+
 ## kimi-k2.7 via opencode (`openrouter/moonshotai/kimi-k2.7-code`)
 
 - 2026-07-06 — adversarial pre-merge review (aicred spark): passed on
