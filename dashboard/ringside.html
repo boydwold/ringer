@@ -931,6 +931,14 @@
         // Morphing syncs attributes from server HTML, which never carries
         // this inline style — re-assert it so the pane owns all scrolling.
         doc.documentElement.style.overflowY = "hidden";
+        // Reset to the floor before remeasuring: the report's own CSS sets
+        // html/body min-height:100%, which resolves against THIS iframe's
+        // current height. Without this reset, that turns into a one-way
+        // ratchet — shorter content after a tall live run reports a
+        // scrollHeight no smaller than the stale height, leaving a growing
+        // blank gap below the real content. Both statements land in the same
+        // task, so there's no visible flicker.
+        frame.style.height = "120px";
         frame.style.height = Math.max(120, doc.documentElement.scrollHeight) + "px";
       } catch (_e) {}
     }
