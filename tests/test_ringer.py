@@ -600,6 +600,46 @@ class RingerCliTests(unittest.TestCase):
         self.assertNotEqual(returncode, 0)
         self.assertIn("[ringer.py] check timed out after 1s", output)
 
+    def test_task_check_timeout_s_overrides_the_global_default(self) -> None:
+        # The per-task field is the whole point of check_timeout_s: a task whose
+        # check legitimately runs longer than 60s must not be killed at 60s and
+        # recorded FAILED with a finished deliverable on disk.
+        task = ringer.TaskSpec.from_obj(
+            {"key": "slow-check", "spec": "x", "check": "true", "check_timeout_s": 300}
+        )
+        self.assertEqual(task.check_timeout_s, 300)
+
+        default_task = ringer.TaskSpec.from_obj({"key": "plain", "spec": "x", "check": "true"})
+        self.assertEqual(default_task.check_timeout_s, ringer.CHECK_TIMEOUT_S)
+
+        with self.assertRaises(ValueError):
+            ringer.TaskSpec.from_obj(
+                {"key": "bad", "spec": "x", "check": "true", "check_timeout_s": 0}
+            )
+
+    def test_task_check_timeout_s_is_honored_by_the_verifier(self) -> None:
+        # Parsing the field is not enough — prove the verifier actually kills at
+        # the task's value and not at the module default.
+        original_timeout = ringer.CHECK_TIMEOUT_S
+        ringer.CHECK_TIMEOUT_S = 60
+        try:
+            task = ringer.TaskSpec.from_obj(
+                {"key": "slow-check", "spec": "x", "check": "sleep 5", "check_timeout_s": 1}
+            )
+            with tempfile.TemporaryDirectory(prefix="ringer-task-check-timeout-") as tmp:
+                started = time.monotonic()
+                result = asyncio.run(ringer.Verifier().verify(task, Path(tmp)))
+                elapsed = time.monotonic() - started
+        finally:
+            ringer.CHECK_TIMEOUT_S = original_timeout
+
+        self.assertTrue(result.check_timed_out)
+        self.assertFalse(result.ok)
+        self.assertIn("[ringer.py] check timed out after 1s", result.raw_output_excerpt)
+        self.assertIn("check_timeout_s", result.raw_output_excerpt)
+        # Killed at the task's 1s, not the module's 60s and not the check's 5s.
+        self.assertLess(elapsed, 5)
+
     def test_token_count_parser_accepts_colon_and_newline_formats(self) -> None:
         self.assertEqual(ringer.parse_token_count("tokens used: 1,234", r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"), 1234)
         self.assertEqual(ringer.parse_token_count("tokens used\n5,678", r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"), 5678)

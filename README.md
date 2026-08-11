@@ -88,7 +88,7 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 
 > **Write checks that print why they fail.** A silent `exit 1` (the `git diff --quiet` style) costs you twice: the retry prompt gets no failure context to fix against, and the eval log records an undiagnosable row. `diff` beats `diff -q`; an assert with a message beats a bare test.
 
-> **Checks are killed at 60 seconds** (`CHECK_TIMEOUT_S`), and the kill is recorded as a task FAILURE — a finished, correct deliverable gets thrown away. That cap is global; a longer timeout passed to your own check script cannot raise it. So a check must never run a full test suite, a build, or a trial merge. Have the worker TEE expensive output to a log file and have the check re-assert the cheap facts plus grep that log for the exact numbers the report claims.
+> **Checks are killed at 60 seconds by default** (`CHECK_TIMEOUT_S`), and the kill is recorded as a task FAILURE — a finished, correct deliverable gets thrown away. Raise it per task with `check_timeout_s`; a longer timeout passed *inside* your own check script cannot raise it, because Ringer kills the whole check from outside. Even with a raised cap, prefer a cheap check: have the worker TEE expensive output to a log file and have the check re-assert the cheap facts plus grep that log for the exact numbers the report claims. A check that runs a full suite is slow feedback on every attempt, not just the failing one.
 
 **Identity**: runs are stamped with an orchestrator identity (shown in Ringside and eval rows). Resolution order: `--identity` > `FLEET_IDENTITY`/`RINGER_IDENTITY` env > a `.fleet-agent` file found walking up from the working directory (drop one in a repo root to give that repo's swarms their own name) > `identity_default` in config > short hostname.
 
@@ -103,7 +103,8 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `engine` | Which configured engine runs this task (default `codex`) |
 | `model` | Which model a harness engine runs for this task — fills the engine's `{model}` placeholder (e.g. `"openrouter/moonshotai/kimi-k2.7"`); empty uses the engine's `model_default` |
 | `task_type` | Optional free-form string naming the kind of work this task is, so the model-performance log can slice pass rates by task shape rather than only by model. Suggested vocabulary: `code-feature`, `code-fix`, `code-review`, `test-hardening`, `docs`, `research`, `persona-review`, `copywriting`, `site-build`, `motion-design`, `image-gen`, `data-pipeline`, `format-conversion`, `probe`, `bakeoff`. Empty is allowed; the log just reports it under `(none)`. |
-| `timeout_s` | Per-task kill timer (default 900) |
+| `timeout_s` | Per-task kill timer for the worker (default 900) |
+| `check_timeout_s` | Per-task kill timer for the `check` command (default 60). Raise it when the check must run something genuinely slow; the timeout message names this field and lands in the retry prompt |
 | `max_attempts` | How many times this task may run (default 2 — one try plus one retry with the check's failure output injected). Set `1` for a hard no-retry lane |
 | `redact_spec` | Replace this task's spec with `[redacted request packet]` in the run state, the logged command line, and the eval row, for specs carrying sensitive material. Redacts Ringer's own records only — captured worker output is never rewritten (invariant), so a worker that echoes its request still puts that text in `worker.log` |
 | `engine_args` | Extra CLI flags for this task's worker, spliced in at the engine's `{engine_args}` placeholder — e.g. `["-c", "model_reasoning_effort=low"]` so the orchestrator picks reasoning depth per task |

@@ -188,12 +188,17 @@ the check's failure output.
 - **Never put a check script or manifest in `~/tmp`.** That is scratch you must
   be able to empty; a check that disappears fails every lane at once. Keep them
   beside the run's other materials — `~/ai-workspaces/_artifacts/work/<date>-<slug>/`.
-- **A `timeout=` inside your own check script is a lie above 60s.**
-  `CHECK_TIMEOUT_S = 60` (`ringer.py:55`) is global and not per-task, so Ringer
-  kills the whole check at 60 seconds no matter what your script allows. A
-  `subprocess.run(..., timeout=2700)` inside a check will never be reached.
-  Either keep the check under a minute or move the slow part into the worker
-  and have the check verify its recorded output.
+- **A `timeout=` inside your own check script does nothing. Raise
+  `check_timeout_s` on the task instead.** Ringer kills the check from outside
+  at `check_timeout_s` seconds (default 60, `ringer.py:55`), so a
+  `subprocess.run(..., timeout=2700)` inside a check is never reached — the
+  whole check is dead at 60s and the task records FAILED, throwing away a
+  finished deliverable. The manifest field is per-task:
+  `"check_timeout_s": 300`. Raise it when the check genuinely needs the time;
+  otherwise still prefer the cheap check — move the slow part into the worker,
+  have it TEE output to a log, and have the check grep that log for the exact
+  numbers the report claims. A slow check is slow on every attempt, not just
+  the failing one.
 
 ## Pattern playbook
 
