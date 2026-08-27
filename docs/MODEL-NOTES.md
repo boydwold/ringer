@@ -312,6 +312,7 @@ opinion where a distinct lineage is the point. Not as a default review lane.
   shallow engagement with the actual code, 212k tokens burned. Don't re-run
   this audition on long structured code review; if it gets another slot,
   try a shorter, more mechanical task first.
+- 2026-08-27 code-review (intake PR #728 round 13, verifier lane, free tier `nvidia/nemotron-3-super-120b-a12b:free`): both attempts died on an OpenRouter HTTP error before any report was written — infrastructure loss, no signal about the model. The paired GLM 5.2 lane on the same spec passed on attempt 2 with a sound report. Free tiers on OpenRouter have now lost 2 of 2 exploration lanes this month; try the paid `nvidia/nemotron-3-super-120b-a12b` before writing the model off.
 
 ## llama-3.3-70b-instruct (via opencode, `openrouter/meta-llama/llama-3.3-70b-instruct:free`)
 
