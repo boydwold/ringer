@@ -712,3 +712,6 @@ found this round. Two rounds, two wins on this surface — promote it from
   first try, catching a false AGENTS.md invariant plus the test that pins the defect in
   place. Third and fourth wins on intake review surfaces; the "default for
   contract/blast-area lanes" call above now extends to frontend and docs-truth.
+
+## DeepSeek V4 Flash (`openrouter/deepseek/deepseek-v4-flash`)
+- 2026-08-27 code-review (intake PR #728 round 15, verifier lane, `openrouter/deepseek/deepseek-v4-flash`, $0.03/M in): PASSED — full revert-proof report (R1–R7 + E1–E6), all verdicts agreed with the GLM 5.2 lane on the same spec, no fabricated findings. It missed the four P3s GLM found (redundant-guard isolation, dead allowlist entries, missing 409 fixture shape), so it is a good second lane, not yet a sole verifier. First paid cheap explorer to complete on this PR after the free tiers were blocked by the account data policy.
