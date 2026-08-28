@@ -171,6 +171,9 @@ checks and raw logs support — no vibes, no worker self-reports.
   it line for line. It also correctly recorded UNPINNED only after full-suite runs, and
   restored the tree. ~$0.033 for the lane. Promote GLM for frontend/RTL mutation work.
 
+- 2026-08-27 — code-feature, intake INT-779 (TXT-notice pagination), sandboxed opencode engine in worktrees mode, 9 one-task rounds: 9/9 first-try (test author x6, implementer x3), 39k–61k tokens, 16–333 s each. Tight specs with an exact contract and an executed check (stub-first / mutation-pin / green) were enough; no retries. One round-2 regression (a trailing blank page) slipped past the check because no test pinned it — a check defect, not a model one.
+- 2026-08-27 — code-feature/code-fix, intake INT-323 (React fold-all control; Jest/RTL via react-app-rewired). 4 tasks, 4/4 first-try, 45k–125k tokens. Test author followed the contract exactly, including a wrong assumption I gave it; the implementer then added hidden state (`mounted`) to satisfy that wrong test rather than stopping — it will bend the component to a read-only test. Give implementer specs an explicit MUST-NOT-CHANGE list and a 'stop and write notes.md' instruction; with that, the redo was 60 s, 45k tokens, clean.
+
 ## kimi-k3 (`openrouter/moonshotai/kimi-k3`) — DEMOTED for code-review
 
 **Do not route review lanes here. Use codex.** Recorded so the next orchestrator
@@ -712,6 +715,9 @@ found this round. Two rounds, two wins on this surface — promote it from
   first try, catching a false AGENTS.md invariant plus the test that pins the defect in
   place. Third and fourth wins on intake review surfaces; the "default for
   contract/blast-area lanes" call above now extends to frontend and docs-truth.
+
+- 2026-08-27 code-review (pr734 blast-area, glm-5.2): 1 attempt, thorough caller/geometry/ADR sweep with executed test counts; report accepted as-is.
+- 2026-08-27 code-review (pr734 test-integrity, codex): sandbox refused writes to the supplied worktree; worker made its own clone in /private/tmp and finished. Give codex lanes a scratch path it can write, and clean /private/tmp after. Orchestrator check regex expected "=" decorated pytest summaries; under -q there are none — match "N failed" plainly.
 
 ## DeepSeek V4 Flash (`openrouter/deepseek/deepseek-v4-flash`)
 - 2026-08-27 code-review (intake PR #728 round 15, verifier lane, `openrouter/deepseek/deepseek-v4-flash`, $0.03/M in): PASSED — full revert-proof report (R1–R7 + E1–E6), all verdicts agreed with the GLM 5.2 lane on the same spec, no fabricated findings. It missed the four P3s GLM found (redundant-guard isolation, dead allowlist entries, missing 409 fixture shape), so it is a good second lane, not yet a sole verifier. First paid cheap explorer to complete on this PR after the free tiers were blocked by the account data policy.
