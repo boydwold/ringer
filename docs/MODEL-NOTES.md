@@ -97,6 +97,8 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## glm-5.2 via opencode (`openrouter/z-ai/glm-5.2`)
 
+- 2026-08-27 code-review (intake PR #738, blast-area lane, INT-323 fold-all button). PASS attempt 1, 65k tokens, 275 s (codex lanes: ~75 s). Traced the only production caller, the hover-clear path into Viewer/PagePreview, the sticky-heading CSS, and ran FieldCards.test.tsx read-only (198/198). Honest 'No findings' with a full Clean section and a medium-confidence INT-813 assessment marked as inference. Slow but the citations all resolved; still a safe blast-area lane.
+
 - 2026-08-24 code-review (intake PR #715, blast-area lane). Best of the three lanes: found five stale-`v0` sites the other lanes and CodeRabbit both missed (`infra/delivery.ts`, `Tiltfile`, `config/delivery/bx/columns.yaml`, frontend fixture), read `DeliveryPreview.tsx` in full to prove the fixture was opaque rather than asserting it, and correctly refused to recommend rewriting historical records under `docs/superpowers/`. 1139 words, 17 citations, all resolved. Retried once — my checker's fault, not the model's.
 
 - The cheap-intelligence default (~$0.74/M in, $2.33/M out, 2026-07 —
@@ -702,6 +704,8 @@ found this round. Two rounds, two wins on this surface — promote it from
   not a per-model gamble. Until then, spend exploration slots on paid-but-cheap
   candidates, or fix the setting once at
   https://openrouter.ai/settings/privacy and re-audition the backlog.
+- 2026-08-28 code-review (intake PR #737, correctness lane, codex high): 1 attempt, 123k tokens, 5m13s. Found the one real P2 (malformed child cell falls through Alt to the loan's value) with an executed probe; confirmed by hand. Correctly judged the author's deliberate reversal of the issue's guard 2.
+- 2026-08-28 code-review (intake PR #737, test-integrity lane, codex medium): 1 attempt, 282k tokens, 21m. Nine mutations in a cp'd sandbox, all restored with proven diffs; found 1 unpinned claim (merge precedence). Lesson: PYTHONPATH did NOT beat the editable install for this worker — it used `-o pythonpath=$PWD/src`; put that flag in the spec next time.
 
 ## GLM 5.2 (continued)
 
@@ -718,6 +722,7 @@ found this round. Two rounds, two wins on this surface — promote it from
 
 - 2026-08-27 code-review (pr734 blast-area, glm-5.2): 1 attempt, thorough caller/geometry/ADR sweep with executed test counts; report accepted as-is.
 - 2026-08-27 code-review (pr734 test-integrity, codex): sandbox refused writes to the supplied worktree; worker made its own clone in /private/tmp and finished. Give codex lanes a scratch path it can write, and clean /private/tmp after. Orchestrator check regex expected "=" decorated pytest summaries; under -q there are none — match "N failed" plainly.
+- 2026-08-28 code-review (intake PR #737, blast-area lane, glm-5.2): 1 attempt, 70k tokens, 4m24s. Swept all five Children sites, _walk_validate gating, removal consumers, ADR_INT-068 §7/§8 body; ran the delivery test sweep and correctly diagnosed 3 failures as cwd fixture-path artifacts. No findings, all confirmed. Report accepted as-is.
 
 ## DeepSeek V4 Flash (`openrouter/deepseek/deepseek-v4-flash`)
 - 2026-08-27 code-review (intake PR #728 round 15, verifier lane, `openrouter/deepseek/deepseek-v4-flash`, $0.03/M in): PASSED — full revert-proof report (R1–R7 + E1–E6), all verdicts agreed with the GLM 5.2 lane on the same spec, no fabricated findings. It missed the four P3s GLM found (redundant-guard isolation, dead allowlist entries, missing 409 fixture shape), so it is a good second lane, not yet a sole verifier. First paid cheap explorer to complete on this PR after the free tiers were blocked by the account data policy.
