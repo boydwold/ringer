@@ -196,6 +196,106 @@ class LintManifestTests(unittest.TestCase):
             "manifest: write collision on /tmp/shared-deliverable.txt: listed by one, two.",
         )
 
+    def test_deliverable_outside_taskdir_is_flagged(self) -> None:
+        # The 2026-08-28 pr743 failure: all three lanes did the work, then could
+        # not write lane-*.md into the run's parent dir because the sandbox only
+        # allows writes under the taskdir. Ringer recorded FAILED for finished work.
+        manifest = self.manifest(
+            [self.task("blast-area", expect_files=["/tmp/ringer-lint/lane-blast-area.md"])],
+        )
+        findings = lint_manifest(manifest)
+        self.assertTrue(
+            any("outside the task's writable root" in f for f in findings),
+            f"escaping deliverable should be flagged: {findings}",
+        )
+
+    def test_export_inside_invoked_script_is_recognised(self) -> None:
+        # A check is often a one-line delegation to a script, with the copy
+        # inside it. Reading the script is what keeps working runs quiet.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "check_export.sh"
+        script.write_text(
+            "#!/bin/sh\nset -e\ncp report.md /tmp/ringer-lint/out.md\n"
+            "test -s /tmp/ringer-lint/out.md || { echo 'FAIL: missing'; exit 1; }\n"
+        )
+        manifest = self.manifest(
+            [self.task("one", expect_files=["/tmp/ringer-lint/out.md"], check=f"sh {script}")]
+        )
+        self.assertFalse(
+            any("outside the task's writable root" in f for f in lint_manifest(manifest)),
+            "export inside the invoked script should suppress the finding",
+        )
+
+    def test_verify_only_script_is_still_flagged(self) -> None:
+        # INT-157's real shape: the script only checks dimensions, so nothing
+        # creates the escaping file. It passed only because an out-of-band copy
+        # landed the files 10 minutes after the worker wrote them to its taskdir.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "check_verify.sh"
+        script.write_text(
+            "#!/bin/sh\nf=/tmp/ringer-lint/out.png\n"
+            "test -s \"$f\" || { echo \"FAIL: $f too small\"; exit 1; }\n"
+        )
+        manifest = self.manifest(
+            [self.task("shot", expect_files=["/tmp/ringer-lint/out.png"], check=f"zsh {script}")]
+        )
+        self.assertTrue(
+            any("outside the task's writable root" in f for f in lint_manifest(manifest)),
+            "a script that only verifies must still be flagged",
+        )
+
+    def test_verify_only_check_does_not_count_as_export(self) -> None:
+        # The real pr743 check named the escaping path but only tested it. A
+        # "check mentions the path" heuristic would wave this through, which is
+        # the exact bug: three finished lanes recorded FAILED.
+        manifest = self.manifest(
+            [
+                self.task(
+                    "blast-area",
+                    expect_files=["/tmp/ringer-lint/lane-blast-area.md"],
+                    check=(
+                        "test -s /tmp/ringer-lint/lane-blast-area.md || "
+                        "{ echo 'FAIL: lane-blast-area.md does not exist'; exit 1; }"
+                    ),
+                )
+            ],
+        )
+        findings = lint_manifest(manifest)
+        self.assertTrue(
+            any("outside the task's writable root" in f for f in findings),
+            f"verify-only check must still be flagged: {findings}",
+        )
+
+    def test_deliverable_outside_taskdir_allowed_when_check_exports_it(self) -> None:
+        # A check runs unsandboxed, so exporting the file out of the taskdir is
+        # the sanctioned pattern and must not be flagged.
+        manifest = self.manifest(
+            [
+                self.task(
+                    "blast-area",
+                    expect_files=["/tmp/ringer-lint/lane-blast-area.md"],
+                    check=(
+                        "cp report.md /tmp/ringer-lint/lane-blast-area.md && "
+                        "test -s /tmp/ringer-lint/lane-blast-area.md || "
+                        "{ echo 'FAIL: export failed'; exit 1; }"
+                    ),
+                )
+            ],
+        )
+        findings = lint_manifest(manifest)
+        self.assertFalse(
+            any("outside the task's writable root" in f for f in findings),
+            f"check exports the file, should not be flagged: {findings}",
+        )
+
+    def test_deliverable_inside_taskdir_is_clean(self) -> None:
+        manifest = self.manifest([self.task("one", expect_files=["report.md"])])
+        self.assertFalse(
+            any("outside the task's writable root" in f for f in lint_manifest(manifest)),
+        )
+
     def test_w6_relative_paths_do_not_collide(self) -> None:
         # Relative expect_files resolve inside each task's own directory —
         # many tasks emitting report.md/extraction.json is the NORMAL swarm

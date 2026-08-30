@@ -1834,6 +1834,18 @@ def lint_manifest(
             findings.append(
                 f"{task.key}: deliverable would be deleted with the worktree; write it outside the worktree or export it in the check."
             )
+        if not manifest.worktrees:
+            for path in task.expect_files:
+                if (
+                    expect_file_escapes_taskdir(path, manifest.workdir, task.key)
+                    and not check_exports_path(task.check, path)
+                    and not check_delegates_to_unreadable_script(task.check)
+                ):
+                    findings.append(
+                        f"{task.key}: deliverable {path} is outside the task's writable root "
+                        f"({manifest.workdir / task.key}); the sandboxed worker cannot create it "
+                        "— write it in the taskdir, or have the check copy it out."
+                    )
         if manifest.worktrees and instructs_git_commit(task.spec):
             findings.append(
                 f"{task.key}: worker commits die with the worktree; have the worker leave changes uncommitted and export the diff in the check."
@@ -2053,6 +2065,94 @@ def strip_common_redirections(command: str) -> str:
 
 def is_relative_expect_file(path: str) -> bool:
     return bool(path.strip()) and not path.startswith("~") and not Path(path).is_absolute()
+
+
+def expect_file_escapes_taskdir(path: str, workdir: Path, task_key: str) -> bool:
+    """True when an absolute expect_files path lies outside the task's writable root.
+
+    Workers run sandboxed with their taskdir as the only writable root (codex
+    "--sandbox workspace-write", opencode's Seatbelt profile allows TASKDIR),
+    so an absolute deliverable path above the taskdir is unreachable: the
+    worker does the analysis, cannot place the file, and the task records
+    FAILED with the work stranded in its log.
+    """
+    candidate = Path(path.strip()).expanduser()
+    if not candidate.is_absolute():
+        return False
+    try:
+        resolved = candidate.resolve()
+        taskdir = (workdir / task_key).resolve()
+    except OSError:
+        return False
+    return not resolved.is_relative_to(taskdir)
+
+
+EXPORT_VERB_RE = re.compile(
+    r"(?:\bcp\b|\bmv\b|\binstall\b|\btee\b|\brsync\b|\bditto\b|>>?\s*$)",
+    re.IGNORECASE,
+)
+
+
+SCRIPT_ARG_RE = re.compile(r"""["']?(/[\w./~-]+\.(?:sh|zsh|bash|py))["']?""")
+
+
+def _check_text_with_scripts(check: str, *, _budget: int = 64_000) -> str:
+    """The check command plus the contents of any local script it invokes.
+
+    A check is frequently a one-line delegation to a script
+    (``zsh /path/to/check_screenshot.sh``), and the export happens inside that
+    script. Without reading it, a purely textual rule cannot tell an exporting
+    check from a verifying one and produces false positives on working runs.
+    """
+    parts = [check]
+    for match in SCRIPT_ARG_RE.finditer(check):
+        script = Path(match.group(1)).expanduser()
+        try:
+            if script.is_file():
+                parts.append(script.read_text(errors="replace")[:_budget])
+        except OSError:
+            continue
+    return "\n".join(parts)
+
+
+def check_delegates_to_unreadable_script(check: str) -> bool:
+    """True when the check invokes a script that cannot be read and inspected."""
+    for match in SCRIPT_ARG_RE.finditer(check):
+        script = Path(match.group(1)).expanduser()
+        try:
+            if not script.is_file():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def check_exports_path(check: str, path: str) -> bool:
+    """True when the check itself CREATES the deliverable outside the taskdir.
+
+    Checks run under ringer, not the sandboxed worker, so a check that copies
+    the file out of the taskdir is the sanctioned way to land it elsewhere.
+
+    Merely naming the path is NOT export — a check like
+    ``test -s /outside/lane.md || exit 1`` only verifies it, which is precisely
+    the shape that stranded three finished pr743 lanes on 2026-08-28. So the
+    path must be preceded by a write verb or a redirect on its own segment,
+    searched in the check and in any local script the check invokes.
+    """
+    stripped = path.strip()
+    name = Path(stripped).name
+    if not name:
+        return False
+    haystack = _check_text_with_scripts(check)
+    for needle in (stripped, name):
+        for match in re.finditer(re.escape(needle), haystack):
+            prefix = haystack[max(0, match.start() - 60) : match.start()]
+            # Cut at the nearest command separator so a write verb from an
+            # earlier command in the chain cannot vouch for this occurrence.
+            segment = re.split(r"(?:&&|\|\||;|\||\{|\}|\n)", prefix)[-1]
+            if EXPORT_VERB_RE.search(segment):
+                return True
+    return False
 
 
 def instructs_git_commit(spec: str) -> bool:
