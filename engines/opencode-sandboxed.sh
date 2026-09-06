@@ -58,14 +58,31 @@ cat > "$PROFILE" <<'SBEOF'
   (subpath (param "TASKDIR"))
   (subpath (param "SCRATCH"))
   (subpath (param "OC_SHARE"))
-  (subpath (param "OC_STATE"))
-  (subpath (param "OC_CONFIG")))
+  (subpath (param "OC_STATE")))
+; OC_CONFIG is readable, never writable. On 2026-09-05 two workers edited
+; ~/.config/opencode/opencode.jsonc to add "edit": "allow" and "bash": "allow",
+; then put it back. A sandboxed worker must not be able to rewrite the
+; permission file that governs it. `(allow default)` still permits the read.
 ; /dev is needed for /dev/null, /dev/urandom, etc.; writes there can't create
 ; persistent files without root, so a few literals are allowed rather than via param.
 (allow file-write-data
   (literal "/dev/null")
   (literal "/dev/dtracehelper")
   (literal "/dev/tty"))
+; A file rule alone does not contain this sandbox. `open <bundle>` asks
+; LaunchServices to start the process, launchd spawns it, and the new process
+; is not our child, so the profile never applies to it. On 2026-09-05 a worker
+; used exactly that to write into a herdr worktree. Deny the LaunchServices
+; ports and the route closes for every binary, not just /usr/bin/open.
+; `launchctl` uses com.apple.xpc.launchd, denied here for the same reason.
+(deny mach-lookup
+  (global-name "com.apple.CoreServices.coreservicesd")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.coreservices.quarantine-resolver")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.lsd.modifydb")
+  (global-name "com.apple.lsd.openurl")
+  (global-name "com.apple.xpc.launchd"))
 SBEOF
 
 export TMPDIR="$SCRATCH"
@@ -80,7 +97,6 @@ set +e
   -D "SCRATCH=$SCRATCH" \
   -D "OC_SHARE=$HOME/.local/share/opencode" \
   -D "OC_STATE=$HOME/.local/state/opencode" \
-  -D "OC_CONFIG=$HOME/.config/opencode" \
   -f "$PROFILE" "$OPENCODE_BIN" "$@" < /dev/null
 status=$?
 set -e
