@@ -32,7 +32,7 @@ EXCLUDED_AUTHORS = {
     # DOES owe credit for merged work — never send this line in a PR.
     "boyd wold",
 }
-EXCLUDED_AUTHOR_PREFIXES = ("claude",)
+EXCLUDED_AUTHOR_PREFIXES = ("claude", "cursor")
 EXCLUDED_HANDLES = {
     "justfinethanku",
     "natebjones-projects",
