@@ -18,6 +18,13 @@ dashboard_port_base = 8787
 # dashboard open in the browser.
 # hud_app_path = "/Applications/Ringside.app"
 
+# Ringside, the persistent run page, always listens on 127.0.0.1. To watch runs
+# from another machine, list this machine's other addresses here, for example
+# its Tailscale address. Anyone who can reach that address can see the runs.
+# [hud]
+# port = 8700
+# listen = ["100.64.0.7"]
+
 # Belt-and-suspenders full-access gate. A task with "full_access": true will
 # still fail unless this is true.
 allow_full_access = false

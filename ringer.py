@@ -1073,6 +1073,7 @@ class AppConfig:
     steering: SteeringConfig = field(default_factory=SteeringConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
     engine_bin_diagnostics: tuple[EngineBinDiagnostic, ...] = ()
+    hud_listen: tuple[str, ...] = ()
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1093,6 +1094,7 @@ class AppConfig:
         if dashboard_port_base <= 0:
             raise ValueError("dashboard_port_base must be positive")
         hud_port = load_hud_port(data.get("hud"))
+        hud_listen = load_hud_listen(data.get("hud"))
         identity_default = optional_string(data.get("identity_default"))
         hud_app_path = optional_path(data.get("hud_app_path"))
         allow_full_access = bool(data.get("allow_full_access", False))
@@ -1117,6 +1119,7 @@ class AppConfig:
             state_dir=state_dir,
             dashboard_port_base=dashboard_port_base,
             hud_port=hud_port,
+            hud_listen=hud_listen,
             hud_app_path=hud_app_path,
             allow_full_access=allow_full_access,
             eval=eval_config,
@@ -1575,6 +1578,20 @@ def load_hud_port(raw: Any) -> int:
     if port <= 0:
         raise ValueError("hud.port must be positive")
     return port
+
+
+def load_hud_listen(raw: Any) -> tuple[str, ...]:
+    """Extra addresses Ringside listens on, besides 127.0.0.1.
+
+    A machine that runs swarms for someone watching from another machine
+    (a hub reached over Tailscale) lists its Tailscale address here.
+    """
+    if not isinstance(raw, dict) or raw.get("listen") is None:
+        return ()
+    listen = raw["listen"]
+    if not isinstance(listen, list) or not all(isinstance(host, str) and host.strip() for host in listen):
+        raise ValueError("hud.listen must be a list of addresses")
+    return tuple(host.strip() for host in listen if host.strip() != "127.0.0.1")
 
 
 def configured_engine_names(raw: Any) -> tuple[str, ...]:
@@ -5724,10 +5741,13 @@ class PersistentHudServer:
         preferred_port: int = DEFAULT_HUD_PORT,
         *,
         open_viewer: bool = True,
+        listen: tuple[str, ...] = (),
     ) -> None:
         self.state_dir = state_dir
         self.preferred_port = preferred_port
         self.open_viewer = open_viewer
+        self.listen = listen
+        self.extra_httpds: list[ThreadingHTTPServer] = []
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.port: int | None = None
@@ -5858,6 +5878,15 @@ class PersistentHudServer:
         self.port = int(self.httpd.server_address[1])
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="ringer-hud", daemon=True)
         self.thread.start()
+        for host in self.listen:
+            try:
+                extra = ReusableThreadingHTTPServer((host, self.port), Handler)
+            except OSError as exc:
+                print(f"Ringside: could not also listen on {host}:{self.port} ({exc})", flush=True)
+                continue
+            self.extra_httpds.append(extra)
+            threading.Thread(target=extra.serve_forever, name=f"ringer-hud-{host}", daemon=True).start()
+            print(f"Ringside: also on http://{host}:{self.port}", flush=True)
         url = f"http://127.0.0.1:{self.port}"
         if self.open_viewer:
             with contextlib.suppress(Exception):
@@ -5869,6 +5898,10 @@ class PersistentHudServer:
         return self.start()
 
     def stop(self) -> None:
+        for extra in self.extra_httpds:
+            extra.shutdown()
+            extra.server_close()
+        self.extra_httpds = []
         if self.httpd is not None:
             self.httpd.shutdown()
             self.httpd.server_close()
@@ -10988,6 +11021,7 @@ def run_persistent_hud(config: AppConfig, *, port: int | None, open_viewer: bool
         config.state_dir,
         preferred_port=chosen_port,
         open_viewer=open_viewer,
+        listen=config.hud_listen,
     )
     server.model_log_path = config.eval.jsonl_path
     server.default_model_log_path = config.eval.jsonl_path

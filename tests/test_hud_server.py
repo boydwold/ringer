@@ -120,6 +120,25 @@ class PersistentHudServerTests(unittest.TestCase):
         self.addCleanup(server.stop)
         return server, port
 
+    def test_hud_listen_takes_extra_addresses_and_drops_loopback(self) -> None:
+        self.assertEqual((), ringer.load_hud_listen(None))
+        self.assertEqual((), ringer.load_hud_listen({"port": 8700}))
+        self.assertEqual(("100.64.0.7",), ringer.load_hud_listen({"listen": ["127.0.0.1", " 100.64.0.7 "]}))
+        with self.assertRaises(ValueError):
+            ringer.load_hud_listen({"listen": "100.64.0.7"})
+
+    def test_an_extra_address_that_cannot_bind_is_reported_and_loopback_still_serves(self) -> None:
+        server = PersistentHudServer(
+            self.state_dir, preferred_port=0, open_viewer=False, listen=("192.0.2.1",)
+        )
+        with mock.patch("builtins.print") as printed:
+            port = server.start()
+        self.addCleanup(server.stop)
+        self.assertEqual([], server.extra_httpds)
+        self.assertTrue(any("could not also listen on 192.0.2.1" in str(c) for c in printed.call_args_list))
+        with urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+            self.assertEqual(200, response.status)
+
     def test_hud_serves_runs_library_artifacts_logs_and_ringside_page(self) -> None:
         _server, port = self.start_server()
         base = f"http://127.0.0.1:{port}"
