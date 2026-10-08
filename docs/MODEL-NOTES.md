@@ -17,6 +17,13 @@ checks and raw logs support — no vibes, no worker self-reports.
 - Strongest general worker; the default engine. Spend reasoning effort per
   task via `engine_args` (`["-c", "model_reasoning_effort=low|medium|high"]`)
   — high on gnarly tasks, low on boilerplate.
+- 2026-10-01 — code-fix, patching a closed-source compiled npm build
+  (lokka 2.1.2 + msal-node-extensions, run lokka-auth-hardening, klipsch):
+  3/3 first-attempt PASS (20k medium, 43k + 64k high). Its sandbox blocks
+  libsecret/D-Bus and network, so its own native/live runs fail with
+  "Operation not permitted" — say so in the spec, or it reports a false
+  FAIL (round 1 did). Review caught one semantic flaw a green check
+  cannot: an error flag cleared only on an interactive reconnect.
 - 2026-07-05 — carried the heavy lanes of the milk-crate demo rehearsals
   (market read with source allowlist, site build) with clean first-attempt
   passes.
