@@ -576,6 +576,26 @@
     });
     while (have.childNodes.length > desired.length) have.lastChild.remove();
   }
+  function infraText(infra) {
+    return Object.entries(infra || {})
+      .sort(([a, n], [b, m]) => num(m) - num(n) || a.localeCompare(b))
+      .map(([cls, count]) => `${cls} ×${count}`)
+      .join(", ");
+  }
+  function modelInfraDetail(row) {
+    const counts = infraText(row.infra);
+    return counts
+      ? `<details class="model-infra"><summary>Infrastructure failures</summary><p>Not counted in rates: ${esc(counts)}</p></details>`
+      : "";
+  }
+  function infraOnlyRow(columns) {
+    const items = state.models?.infra_only || [];
+    if (!items.length) return "";
+    // The API list describes the whole selected run family, across task types.
+    return `<tr><td colspan="${columns}"><section class="infra-only"><h3>Infrastructure only</h3><p>All task types · not counted in rates</p><ul>${items
+      .map((r) => `<li>${esc(r.model_display || r.model || "Unknown")} (no model evidence yet): ${esc(infraText(r.infra))}</li>`)
+      .join("")}</ul></section></td></tr>`;
+  }
   function renderModels() {
     const rows = state.taskType
       ? (state.models?.groups || []).filter(
@@ -617,22 +637,22 @@
         : esc(duration(r.median_duration_ms / 1000));
     replace(
       $("model-rows"),
-      sorted
+      (sorted
         .map(
           (r) =>
-            `<tr class="${num(r.tasks) < 5 ? "low-sample" : ""}"><td>${modelName(r)}</td><td>${esc(r.harness || r.engine || "Unknown")}</td><td><span class="rate">${Math.round(num(r.first_try_pass_rate) * 100)}%</span>${progress(num(r.first_try_pass_rate) * 100, 100)}</td><td>${num(r.tasks)}</td><td>${num(r.attempts)}</td><td>${speed(r)}</td></tr>`,
+            `<tr class="${num(r.tasks) < 5 ? "low-sample" : ""}"><td>${modelName(r)}${modelInfraDetail(r)}</td><td>${esc(r.harness || r.engine || "Unknown")}</td><td><span class="rate">${Math.round(num(r.first_try_pass_rate) * 100)}%</span>${progress(num(r.first_try_pass_rate) * 100, 100)}</td><td>${num(r.tasks)}</td><td>${num(r.attempts)}</td><td>${speed(r)}</td></tr>`,
         )
         .join("") ||
-        `<tr><td colspan="6">${state.modelError ? "No model results are available." : "No executed checks recorded for this task type yet."}</td></tr>`,
+        `<tr><td colspan="6">${state.modelError ? "No model results are available." : "No executed checks recorded for this task type yet."}</td></tr>`) + infraOnlyRow(6),
     );
     replace(
       $("model-signal-rows"),
       sorted
         .map(
           (r) =>
-            `<tr><td>${modelName(r)}</td><td>${esc(r.lab || "Unknown")}</td><td>${esc(r.harness || r.engine || "Unknown")}</td><td>${esc(r.access || "Unknown")}</td><td>${r.misrouted || r.unattributed ? "Not ranked" : esc(r.tier || "Unranked")}</td><td>${num(r.tasks)}</td><td>${Math.round(num(r.first_try_pass_rate) * 100)}%</td><td>${Math.round(num(r.pass_rate) * 100)}%</td><td>${r.median_tokens == null ? "—" : num(r.median_tokens).toLocaleString()}</td><td>${speed(r)}</td><td>${esc(age(r.last_seen))}</td><td class="judgment-notes">${esc(r.latest_note || (r.notes || []).join("\n"))}</td></tr>`,
+            `<tr><td>${modelName(r)}${modelInfraDetail(r)}</td><td>${esc(r.lab || "Unknown")}</td><td>${esc(r.harness || r.engine || "Unknown")}</td><td>${esc(r.access || "Unknown")}</td><td>${r.misrouted || r.unattributed ? "Not ranked" : esc(r.tier || "Unranked")}</td><td>${num(r.tasks)}</td><td>${Math.round(num(r.first_try_pass_rate) * 100)}%</td><td>${Math.round(num(r.pass_rate) * 100)}%</td><td>${r.median_tokens == null ? "—" : num(r.median_tokens).toLocaleString()}</td><td>${speed(r)}</td><td>${esc(age(r.last_seen))}</td><td class="judgment-notes">${esc(r.latest_note || (r.notes || []).join("\n"))}</td></tr>`,
         )
-        .join(""),
+        .join("") + infraOnlyRow(12),
     );
   }
   async function request(path, type = "json") {

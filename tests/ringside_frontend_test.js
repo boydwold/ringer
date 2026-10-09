@@ -323,6 +323,37 @@ const data = {
   await settle();
   assert.match(empty.el("run-picker").innerHTML, /No runs yet/);
   assert.equal(empty.el("open-folder").disabled, true);
+  const infraModels = {
+    ...models,
+    rollup: [{ ...models.rollup[0], infra: { provider_error: 1, rate_limited: 3, "<script>bad</script>": 1 } }],
+    groups: [{ ...models.groups[0], infra: { provider_policy: 2 } }],
+    infra_only: [{ model_display: "Only <b>model</b>", infra: { provider_error: 4 } }],
+  };
+  const infraEnv = environment({ ...data, "/api/models": infraModels });
+  await settle();
+  infraEnv.click({ view: "models" });
+  await settle();
+  for (const id of ["model-rows", "model-signal-rows"]) {
+    const markup = infraEnv.el(id).innerHTML;
+    assert.match(markup, /<details class="model-infra">/);
+    assert.match(markup, /rate_limited ×3, &lt;script&gt;bad&lt;\/script&gt; ×1, provider_error ×1/);
+    assert.match(markup, /Not counted in rates/);
+    assert.match(markup, /Infrastructure only/);
+    assert.match(markup, /Only &lt;b&gt;model&lt;\/b&gt; \(no model evidence yet\): provider_error ×4/);
+    assert.doesNotMatch(markup, /<script>|<b>model<\/b>/);
+  }
+  assert.equal((infraEnv.el("model-signal-rows").innerHTML.split("</tr>")[0].match(/<td[ >]/g) || []).length, 12);
+  infraEnv.change("task-type", "research");
+  assert.match(infraEnv.el("model-rows").innerHTML, /provider_policy ×2/);
+  assert.doesNotMatch(infraEnv.el("model-rows").innerHTML, /rate_limited ×3/);
+  assert.match(infraEnv.el("model-rows").innerHTML, /All task types · not counted in rates/);
+  const onlyEnv = environment({ ...data, "/api/models": { rollup: [], groups: [], infra_only: infraModels.infra_only } });
+  await settle();
+  onlyEnv.click({ view: "models" });
+  await settle();
+  assert.match(onlyEnv.el("model-rows").innerHTML, /provider_error ×4/);
+  assert.match(onlyEnv.el("model-signal-rows").innerHTML, /colspan="12"/);
+  assert.doesNotMatch(empty.el("model-rows").innerHTML, /Infrastructure/);
   console.log(
     "PASS: retry evidence, escaping, task search, raw logs, model filtering, dead workers, saved versions, reconnect, native compact/expand, empty states",
   );

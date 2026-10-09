@@ -5725,6 +5725,24 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
         return groups.filter(group => String(group?.display_bucket_id || "") === bucketId);
       }
 
+      function infraText(infra) {
+        return Object.entries(infra || {})
+          .sort(([a, n], [b, m]) => Number(m) - Number(n) || a.localeCompare(b))
+          .map(([cls, count]) => `${cls} ×${count}`).join(", ");
+      }
+
+      function infraDetail(row) {
+        const counts = infraText(row.infra);
+        return counts ? `<p class="model-infra">Infrastructure failures (not counted in rates): ${html(counts)}</p>` : "";
+      }
+
+      function infraOnlyList() {
+        const items = Array.isArray(payload?.infra_only) ? payload.infra_only : [];
+        if (!items.length) return "";
+        return '<section class="infra-only"><h3>Infrastructure only</h3><p>Infrastructure failures (not counted in rates)</p><ul>' +
+          items.map(row => `<li>${html(row.model_display || row.model || "unknown")} (no model evidence yet): ${html(infraText(row.infra))}</li>`).join("") + '</ul></section>';
+      }
+
       function breakdown(bucketId) {
         const groups = groupsFor(bucketId);
         if (!groups.length) return '<div class="empty">No per-task breakdown recorded for this model.</div>';
@@ -5738,7 +5756,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
         ];
         groups.forEach(group => {
           cells.push(
-            `<div>${html(group.task_type || "(untyped)")}</div>`,
+            `<div>${html(group.task_type || "(untyped)")}${infraDetail(group)}</div>`,
             `<div>${numberOrZeroLocal(group.tasks).toLocaleString()}</div>`,
             `<div>${html(percent(group.first_try_pass_rate))}</div>`,
             `<div class="optional">${html(percent(group.pass_rate))}</div>`,
@@ -5755,7 +5773,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
         status.classList.toggle("error", Boolean(error));
         status.textContent = error ? `models unavailable: ${error}` : `updated ${modelDate(payload?.generated_at)}`;
         if (!rows.length) {
-          wrap.innerHTML = '<div class="empty">No model results yet. Run \'./ringer.py models\' for the local scoreboard docs.</div>';
+          wrap.innerHTML = '<div class="empty">No model results yet. Run \'./ringer.py models\' for the local scoreboard docs.</div>' + infraOnlyList();
           return;
         }
         const body = [];
@@ -5785,7 +5803,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<td class="model-notes" title="${html(notes)}">${html(row.latest_note || "")}</td>`,
             '</tr>',
           );
-          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="12">${breakdown(bucketId)}</td></tr>`);
+          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="12">${infraDetail(row)}${breakdown(bucketId)}</td></tr>`);
         });
         wrap.innerHTML = [
           '<table class="models-table">',
@@ -5796,6 +5814,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
           '</tr></thead>',
           `<tbody>${body.join("")}</tbody>`,
           '</table>',
+          infraOnlyList(),
         ].join("");
       }
 
@@ -6121,6 +6140,7 @@ class PersistentHudServer:
                             "columns": list(MODEL_SCOREBOARD_COLUMNS),
                             "groups": [],
                             "rollup": [],
+                            "infra_only": [],
                             "error": str(exc) or exc.__class__.__name__,
                         }
                     send_json_response(self, payload)
@@ -6878,6 +6898,80 @@ def infra_only_models(
         cls = str(row["failure_class"])
         entry["infra"][cls] = entry["infra"].get(cls, 0) + 1
     return [infra[k] for k in sorted(infra) if k not in counted]
+
+
+def model_infra_display_items(
+    rows: list[dict[str, Any]],
+    *,
+    registry: ModelIdentityRegistry,
+    family: str = "work",
+    task_type: str | None = None,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
+    items = infra_only_models(
+        rows, family=family, registry=registry, task_type=task_type, model=model,
+    )
+    for item in items:
+        item["model_display"] = registry.resolve(item["engine"], item["model"]).model_display
+    return items
+
+
+def format_model_infra(infra: dict[str, int]) -> str:
+    return ", ".join(
+        f"{cls} ×{count}"
+        for cls, count in sorted(infra.items(), key=lambda item: (-item[1], item[0]))
+    )
+
+
+def render_model_infra_detail(row: dict[str, Any]) -> str:
+    counts = format_model_infra(row.get("infra") or {})
+    if not counts:
+        return ""
+    return (
+        '<p class="model-infra">Infrastructure failures (not counted in rates): '
+        f'{html_escape(counts)}</p>'
+    )
+
+
+def render_infra_only_models(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    entries = "".join(
+        f'<li>{html_escape(str(item.get("model_display") or item["model"]))} '
+        f'(no model evidence yet): {html_escape(format_model_infra(item["infra"]))}</li>'
+        for item in items
+    )
+    return (
+        '<section class="infra-only"><h3>Infrastructure only</h3>'
+        f'<p>Infrastructure failures (not counted in rates)</p><ul>{entries}</ul></section>'
+    )
+
+
+def print_model_infra_details(
+    groups: list[dict[str, Any]],
+    infra_only: list[dict[str, Any]],
+    *,
+    task_type: str | None = None,
+) -> None:
+    # Combine selected family buckets into one detail line per displayed model.
+    models: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for group in groups:
+        if not group.get("infra"):
+            continue
+        display = str(group.get("model_display") or group["model"])
+        key = (str(group.get("engine") or ""), str(group["model"]), display)
+        item = models.setdefault(key, {"model_display": display, "infra": {}})
+        for cls, count in group["infra"].items():
+            item["infra"][cls] = item["infra"].get(cls, 0) + count
+    if not models and not infra_only:
+        return
+    print("\nInfrastructure failures (not counted in rates)")
+    items = [(item, False) for item in models.values()] + [(item, True) for item in infra_only]
+    for item, infrastructure_only in items:
+        display = str(item.get("model_display") or item.get("model") or "unknown")
+        task = f" [{task_type}]" if task_type is not None else ""
+        marker = " (no model evidence yet)" if infrastructure_only else ""
+        print(f"  {display}{task}{marker}: {format_model_infra(item['infra'])}")
 
 
 MODEL_SCOREBOARD_RUN_NAME = "model-scoreboard"
@@ -9189,6 +9283,7 @@ def render_model_table_pair(
             <div class="notes-panel">
               <h3 class="detail-heading">Judgment notes</h3>
               {render_notes_list(notes, notes_path=notes_path)}
+              {render_model_infra_detail(row)}
             </div>
           </div>
         </details>
@@ -9208,6 +9303,7 @@ def render_model_scoreboard_html(
     notes_sections: dict[str, list[str]],
     catalog_events: list[dict[str, Any]] | None = None,
     generated_at: str | None = None,
+    infra_only: list[dict[str, Any]] | None = None,
 ) -> str:
     catalog_by_id = catalog_models_by_id(catalog_models)
     ordered = order_model_scoreboard_rows(rows, catalog_by_id)
@@ -9292,6 +9388,7 @@ def render_model_scoreboard_html(
         <tbody>{table_rows}</tbody>
       </table>
     </div>
+    {render_infra_only_models(infra_only or [])}
   </main>
   <footer class="scoreboard-footer">
     <span>{fmt_int(rows_read)} rows read, {fmt_int(skipped)} skipped lines. Ordering sorts by evidence tier first: proven n&gt;=3, then probation; ties use first-try pass rate and pass rate. Misrouted and unattributed legacy rows are not ranked or tiered.</span>
@@ -9317,12 +9414,14 @@ def write_model_scoreboard_html(
     notes_path: Path,
     notes_sections: dict[str, list[str]],
     catalog_events: list[dict[str, Any]] | None = None,
+    infra_only: list[dict[str, Any]] | None = None,
 ) -> Path:
     target = path
     if target is None:
         target = artifact_live_path(config.state_dir, MODEL_SCOREBOARD_RUN_NAME)
     target = target.expanduser().resolve()
     html = render_model_scoreboard_html(
+        infra_only=infra_only,
         rows=rows,
         log_path=log_path,
         rows_read=rows_read,
@@ -9476,6 +9575,7 @@ def build_models_api_payload(
         "columns": list(MODEL_SCOREBOARD_COLUMNS),
         "groups": groups,
         "rollup": ordered_rollup,
+        "infra_only": model_infra_display_items(rows, family=family, registry=identity_registry),
     }
 
 
@@ -9551,24 +9651,28 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
             registry=identity_registry,
         )
         return 0
+    infra_only = model_infra_display_items(
+        rows, family=family, registry=identity_registry, task_type=args.task_type, model=args.model,
+    )
     html_arg = getattr(args, "html", None)
     open_requested = bool(getattr(args, "open", False))
+    scoreboard_rows = enrich_model_groups_with_notes(
+        enrich_model_groups_with_identity(
+            aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
+            rows,
+            identity_registry,
+            include_task_type=False,
+            catalog_models=catalog_models,
+        ),
+        notes_sections,
+    )
     if html_arg is not None or open_requested:
-        scoreboard_rows = enrich_model_groups_with_notes(
-            enrich_model_groups_with_identity(
-                aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
-                rows,
-                identity_registry,
-                include_task_type=False,
-                catalog_models=catalog_models,
-            ),
-            notes_sections,
-        )
         explicit_path = None
         if html_arg not in {None, ""}:
             explicit_path = Path(str(html_arg))
         page_path = write_model_scoreboard_html(
             config,
+            infra_only=infra_only,
             path=explicit_path,
             rows=scoreboard_rows,
             log_path=log_path,
@@ -9588,6 +9692,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(json.dumps(groups))
     else:
         print_model_log_table(log_path, len(rows), skipped, groups)
+        print_model_infra_details(scoreboard_rows, infra_only, task_type=args.task_type)
     return 0
 
 

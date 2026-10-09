@@ -375,6 +375,10 @@ Read it with:
 
 The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. The signal for routing is `first_try_pass_rate` — the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
 
+Rates count model evidence only: a `PASS` or an attempt with `failure_class = "model"` (legacy rows without a failure class retain their previous behavior). Infrastructure failures do not consume a model attempt or reduce these rates. Each model's detail shows counts such as `rate_limited ×3, provider_error ×1`; the CLI prints them below the tables. Models with only infrastructure failures appear separately as “no model evidence yet.”
+
+Run families keep real work and auditions separate. `models --family work` is the default; use `models --family audition` for auditions or `models --family all` to show both. Audition evidence does not promote a model's work tier. The registry at `registry/model-identity.toml` supports `slug_aliases = ["<engine>:<slug>", ...]` on a model entry to combine spelling variants under the same canonical model identity and evidence counts.
+
 History from before the `model` / `task_type` / `retry` columns existed can be seeded in one pass:
 
 ```bash
@@ -423,6 +427,8 @@ Once you have a catalog and a log, `models --explore` joins them into a routing 
 ./ringer.py models --explore                 # tiers across all task types
 ./ringer.py models --explore --task-type docs # tiers for one task shape
 ```
+
+`--explore` skips catalog candidates without tool support and models whose latest attempt within the past seven days was blocked by provider policy (`failure_class = "provider_policy"`).
 
 Models with local evidence are sorted into tiers:
 

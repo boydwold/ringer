@@ -904,3 +904,15 @@ dialog p {
 .compact-run {
   overflow-wrap: anywhere;
 }
+
+.model-infra,
+.infra-only {
+  margin-top: 8px;
+  font-size: 12px;
+  white-space: normal;
+}
+.model-infra summary { cursor: pointer; }
+.model-infra p,
+.infra-only p { color: var(--muted); margin: 6px 0; }
+.infra-only h3 { font-size: 13px; margin: 0; }
+.infra-only ul { margin: 6px 0; padding-left: 20px; }
