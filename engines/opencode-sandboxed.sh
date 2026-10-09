@@ -130,7 +130,11 @@ run_linux() {
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ringer-opencode.XXXXXX")"
   trap 'rm -rf -- "$SCRATCH"' EXIT
   SCRATCH="$(cd "$SCRATCH" && pwd -P)"
-  mkdir -p -- "$OC_SHARE" "$OC_STATE" "$SCRATCH/cache"
+  mkdir -p -- "$SCRATCH/cache" "$SCRATCH/data/opencode" "$SCRATCH/state/opencode"
+  if [ -f "$OC_SHARE/auth.json" ]; then
+    cp -- "$OC_SHARE/auth.json" "$SCRATCH/data/opencode/auth.json"
+    chmod 600 "$SCRATCH/data/opencode/auth.json"
+  fi
 
   local runtime_dir="/run/user/$(id -u)"
   local home_real
@@ -145,8 +149,52 @@ run_linux() {
   case "$OPENCODE_BIN" in
     /tmp/*|"$runtime_dir"/*) args+=(--ro-bind "$OPENCODE_BIN" "$OPENCODE_BIN") ;;
   esac
-  args+=(--bind "$TASKDIR_REAL" "$TASKDIR_REAL" --bind "$SCRATCH" "$SCRATCH"
-    --bind "$OC_SHARE" "$OC_SHARE" --bind "$OC_STATE" "$OC_STATE")
+  # Legacy clients may still write the default paths. If absent, create them
+  # only inside the namespace. A read-only host mount cannot accept new mount
+  # points, so mirror the nearest existing parents with read-only children.
+  local path parent entry link
+  local -a private_parents=() missing_state=()
+  for path in "$OC_SHARE" "$OC_STATE"; do
+    if [ ! -d "$path" ]; then
+      missing_state+=("$path")
+      parent="${path%/*}"
+      while [ ! -d "$parent" ]; do parent="${parent%/*}"; done
+      if [ "${private_parents[0]:-}" != "$parent" ]; then
+        private_parents+=("$parent")
+      fi
+    fi
+  done
+  # Ancestors must be mirrored before descendants, or a later parent mount
+  # would hide an already prepared child (e.g. .local and .local/share).
+  if [ "${#private_parents[@]}" -eq 2 ] &&
+     [ "${#private_parents[0]}" -gt "${#private_parents[1]}" ]; then
+    private_parents=("${private_parents[1]}" "${private_parents[0]}")
+  fi
+  for parent in "${private_parents[@]}"; do
+    args+=(--tmpfs "$parent")
+    for entry in "$parent"/* "$parent"/.[!.]* "$parent"/..?*; do
+      if [ -L "$entry" ]; then
+        link="$(readlink -n -- "$entry"; printf '.')"
+        args+=(--symlink "${link%.}" "$entry")
+      elif [ -e "$entry" ]; then
+        args+=(--ro-bind "$entry" "$entry")
+      fi
+    done
+  done
+  for path in "${missing_state[@]}"; do args+=(--dir "$path"); done
+  for parent in "${private_parents[@]}"; do args+=(--remount-ro "$parent"); done
+  # Empty compatibility mounts stay separate from the credential-bearing XDG
+  # data directory, so the original auth.json path never reveals its copy.
+  for path in "${missing_state[@]}"; do
+    parent="${path%/*}"
+    mkdir -p -- "$SCRATCH/legacy/${parent##*/}"
+    args+=(--bind "$SCRATCH/legacy/${parent##*/}" "$path")
+  done
+  # Hide shared credentials/history without creating directories in the real home.
+  # Restore writable task/scratch mounts afterwards, even if nested under a mask.
+  if [ -d "$OC_SHARE" ]; then args+=(--tmpfs "$OC_SHARE"); fi
+  if [ -d "$OC_STATE" ]; then args+=(--tmpfs "$OC_STATE"); fi
+  args+=(--bind "$TASKDIR_REAL" "$TASKDIR_REAL" --bind "$SCRATCH" "$SCRATCH")
   local hidden
   for hidden in "${HIDDEN_PATHS[@]}"; do
     if [ -d "$hidden" ]; then
@@ -163,7 +211,8 @@ run_linux() {
   for variable in "${!HERDR_@}"; do
     args+=(--unsetenv "$variable")
   done
-  args+=(--setenv TMPDIR "$SCRATCH" --setenv XDG_CACHE_HOME "$SCRATCH/cache")
+  args+=(--setenv TMPDIR "$SCRATCH" --setenv XDG_CACHE_HOME "$SCRATCH/cache"
+    --setenv XDG_DATA_HOME "$SCRATCH/data" --setenv XDG_STATE_HOME "$SCRATCH/state")
 
   # Exercise all mounts/namespaces before starting the worker. A setup error
   # must never fall back to running it directly or masquerade as its exit code.
