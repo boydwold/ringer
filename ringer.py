@@ -3025,7 +3025,7 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
         context_length = int(context_length_raw)
     except (TypeError, ValueError):
         context_length = 0
-    return {
+    model = {
         "id": model_id,
         "name": str(raw.get("name", "")).strip() or model_id,
         "context_length": context_length,
@@ -3038,6 +3038,14 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
         "free": is_free,
         "fetched_at": fetched_at,
     }
+
+    if "supported_parameters" in raw:
+        parameters = raw["supported_parameters"]
+        model["supported_parameters"] = (
+            [value for value in parameters if isinstance(value, str)]
+            if isinstance(parameters, list) else []
+        )
+    return model
 
 
 def normalize_catalog_payload(payload: dict[str, Any], *, fetched_at: str) -> list[dict[str, Any]]:
@@ -3464,6 +3472,7 @@ def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
         not bool(model.get("variable_pricing"))
         and str(model.get("modality", "")).strip().lower() == "text->text"
         and context_length >= 32000
+        and ("supported_parameters" not in model or "tools" in (model["supported_parameters"] or []))
     )
 
 
@@ -3486,6 +3495,8 @@ def catalog_explore_candidates(
     tested_models: set[str],
     limit: int = 10,
     priced_slots: int = 4,
+    audition_passed: set[str] | None = None,
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
     """Untested text candidates: mostly free, but always some priced ones.
 
@@ -3494,17 +3505,28 @@ def catalog_explore_candidates(
     most-used coding models on OpenRouter. Reserve `priced_slots` for models that
     cost something so the ladder can actually reach them.
     """
-    tested = {normalise_model_slug(m) for m in tested_models}
+    def key(slug: str) -> str:
+        return normalise_model_slug(registry.canonical_model_key("opencode", slug) if registry else slug)
+
+    tested = {key(m) for m in tested_models}
+    auditioned = {key(m) for m in (audition_passed or set())}
     reserved = {normalise_model_slug(m) for m in RESERVED_FIXTURE_MODELS}
     candidates = [
         model
         for model in catalog_models
-        if normalise_model_slug(model.get("id", "")) not in tested
+        if key(model.get("id", "")) not in tested
         and normalise_model_slug(model.get("id", "")) not in reserved
         and catalog_model_is_text_candidate(model)
     ]
     price = lambda m: float(m.get("prompt_per_m") or 0) + float(m.get("completion_per_m") or 0)
     by_price = lambda m: (price(m), str(m.get("id") or ""))
+    priority = sorted(
+        [m for m in candidates if key(m.get("id", "")) in auditioned],
+        key=lambda m: (not bool(m.get("free")), by_price(m)),
+    )[:limit]
+    candidates = [m for m in candidates if key(m.get("id", "")) not in auditioned]
+    limit -= len(priority)
+    priced_slots = max(0, priced_slots - sum(not bool(m.get("free")) for m in priority))
     free = sorted([m for m in candidates if m.get("free")], key=by_price)
     paid = sorted([m for m in candidates if not m.get("free")], key=by_price)
     take_paid = min(priced_slots, limit, len(paid))
@@ -3513,7 +3535,7 @@ def catalog_explore_candidates(
     if len(picked) < limit:
         rest = [m for m in free + paid if m not in picked]
         picked += sorted(rest, key=by_price)[: limit - len(picked)]
-    return sorted(picked, key=lambda m: (not bool(m.get("free")), by_price(m)))
+    return priority + sorted(picked, key=lambda m: (not bool(m.get("free")), by_price(m)))
 
 
 def print_model_explore(
@@ -3524,6 +3546,9 @@ def print_model_explore(
     groups: list[dict[str, Any]],
     catalog_path: Path,
     catalog_models: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    task_type: str | None = None,
+    registry: ModelIdentityRegistry | None = None,
 ) -> None:
     print(f"TIERS from {log_path} ({rows_read} rows, {skipped} skipped lines)")
     if not groups:
@@ -3548,8 +3573,42 @@ def print_model_explore(
             f"first={group['first_try_pass_rate']:.2f} pass={group['pass_rate']:.2f}"
         )
 
-    tested_models = {str(group.get("model")) for group in groups if group.get("model")}
-    candidates = catalog_explore_candidates(catalog_models, tested_models=tested_models)
+    rows = canonical_model_log_rows(rows, registry)
+    tested_models: set[str] = set()
+    audition_passed: set[str] = set()
+    for row in task_final_rows(rows):
+        if model_log_row_is_unattributed(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        if task_type is not None and model_log_row_task_type(row) != task_type:
+            continue
+        slug = model_log_row_model(row)
+        if (row.get("run_family") or "work") == "work":
+            tested_models.add(slug)
+        elif row.get("run_family") == "audition" and model_log_text(row.get("verdict")).upper() == "PASS":
+            audition_passed.add(slug)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    for row in rows:
+        if model_log_row_is_unattributed(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        try:
+            stamp = datetime.fromisoformat(model_log_text(row.get("logged_at")))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if not cutoff <= stamp <= now:
+            continue
+        slug = normalise_model_slug(model_log_row_model(row))
+        if slug not in latest or stamp >= latest[slug][0]:
+            latest[slug] = (stamp, row)
+    blocked = {slug for slug, (_, row) in latest.items() if row.get("failure_class") == "provider_policy"}
+    candidates = catalog_explore_candidates(
+        catalog_models, tested_models=tested_models | blocked,
+        audition_passed=audition_passed, registry=registry,
+    )
     print(f"CANDIDATES from {catalog_path}")
     if not candidates:
         print("  no untested text->text candidates with context >= 32000")
@@ -3561,6 +3620,11 @@ def print_model_explore(
             f"out={format_catalog_price(model.get('completion_per_m'))}/M "
             f"ctx={int(model.get('context_length') or 0)}{marker}"
         )
+
+    if blocked:
+        print("blocked by provider policy")
+        for slug in sorted(blocked):
+            print(f"  {slug}")
 
 
 def active_runs_path() -> Path:
@@ -6563,15 +6627,59 @@ def read_model_log_rows(
     return rows, skipped
 
 
+def canonical_model_log_rows(
+    rows: list[dict[str, Any]], registry: ModelIdentityRegistry | None,
+) -> list[dict[str, Any]]:
+    if registry is None:
+        return rows
+    return [
+        dict(row, model=registry.canonical_model_key(
+            model_log_row_engine(row), model_log_text(row.get("model")),
+        )) if not model_log_row_is_unattributed(row) else row
+        for row in rows
+    ]
+
+
+def add_model_group_infra(
+    groups: dict[tuple[Any, ...], dict[str, Any]],
+    rows: list[dict[str, Any]],
+    *,
+    include_task_type: bool,
+    task_type: str | None = None,
+) -> None:
+    """Count infrastructure by its own row identity, including dropped tasks."""
+    for row in rows:
+        if is_model_counted(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        row_task_type = model_log_row_task_type(row)
+        if task_type is not None and row_task_type != task_type:
+            continue
+        unattributed = model_log_row_is_unattributed(row)
+        key = (
+            row.get("run_family") or "work",
+            model_log_row_engine(row), model_log_row_model(row),
+            *((row_task_type,) if include_task_type else ()),
+            "" if unattributed else (model_log_row_reasoning_effort(row) or ""),
+            unattributed,
+        )
+        if key in groups:
+            counts = groups[key]["infra"]
+            cls = str(row["failure_class"])
+            counts[cls] = counts.get(cls, 0) + 1
+
+
 def aggregate_model_log_rows(
     rows: list[dict[str, Any]],
     *,
     task_type: str | None = None,
     model: str | None = None,
     family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
+    rows = canonical_model_log_rows(rows, registry)
     groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     all_rows = rows
+    dropped_infra_rows: list[dict[str, Any]] = []
     rows = model_log_family_rows(rows, family)
     effort_keys = model_reasoning_effort_keys([row for row in rows if is_model_counted(row)])
     for task_rows in group_model_log_tasks(rows):
@@ -6583,6 +6691,7 @@ def aggregate_model_log_rows(
             ),
         )
         if not ordered:
+            dropped_infra_rows.extend(task_rows)
             continue
         first = ordered[0]
         final = ordered[-1]
@@ -6594,7 +6703,9 @@ def aggregate_model_log_rows(
         run_family = final.get("run_family") or "work"
         unattributed = model_log_row_is_unattributed(final)
         reasoning_effort = None if unattributed else model_log_row_reasoning_effort(final)
-        if model is not None and group_model != model:
+        if model is not None and group_model != (
+            registry.canonical_model_key(model_log_row_engine(final), model) if registry else model
+        ):
             continue
         if task_type is not None and group_task_type != task_type:
             continue
@@ -6633,8 +6744,10 @@ def aggregate_model_log_rows(
                 "_tokens": [],
             },
         )
-        for cls, count in model_infra_counts(task_rows).items():
-            group["infra"][cls] = group["infra"].get(cls, 0) + count
+        if registry is None:
+            # Preserve historical task-level attribution for callers without a registry.
+            for cls, count in model_infra_counts(task_rows).items():
+                group["infra"][cls] = group["infra"].get(cls, 0) + count
         group["tasks"] += 1
         group["attempts"] += len(ordered)
         if model_log_text(final.get("verdict")).upper() == "PASS":
@@ -6654,6 +6767,10 @@ def aggregate_model_log_rows(
         if logged_at > group["last_seen"]:
             group["last_seen"] = logged_at
 
+    add_model_group_infra(
+        groups, rows if registry is not None else dropped_infra_rows,
+        include_task_type=True, task_type=task_type,
+    )
     finalized: list[dict[str, Any]] = []
     for group in groups.values():
         tasks_count = group["tasks"]
@@ -6686,7 +6803,7 @@ def aggregate_model_log_rows(
         )
     if family != "work":
         apply_model_work_tiers(
-            finalized, aggregate_model_log_rows(all_rows, task_type=task_type, model=model),
+            finalized, aggregate_model_log_rows(all_rows, task_type=task_type, model=model, registry=registry),
         )
     return sorted(
         finalized,
@@ -6728,30 +6845,36 @@ def infra_only_models(
     task_type: str | None = None,
     model: str | None = None,
     family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
-    counted: set[tuple[str, str, str]] = set()
+    rows = canonical_model_log_rows(rows, registry)
+    rows = model_log_family_rows(rows, family)
+
+    def selected(row: dict[str, Any]) -> bool:
+        canonical_filter = (
+            registry.canonical_model_key(model_log_row_engine(row), model)
+            if registry and model is not None else model
+        )
+        return (
+            not model_log_row_is_reserved_fixture(row)
+            and (model is None or model_log_row_model(row) == canonical_filter)
+            and (task_type is None or model_log_row_task_type(row) == task_type)
+        )
+
+    def key(row: dict[str, Any]) -> tuple[str, str, str]:
+        return (row.get("run_family") or "work", model_log_row_engine(row), model_log_row_model(row))
+
+    counted = {key(row) for row in task_final_rows(rows) if selected(row)}
     infra: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for task_rows in group_model_log_tasks(model_log_family_rows(rows, family)):
-        model_rows = [row for row in task_rows if is_model_counted(row)]
-        final = max(model_rows or task_rows, key=lambda row: (
-            model_log_text(row.get("logged_at")), 1 if model_log_row_is_retry(row) else 0,
-        ))
-        if model_log_row_is_reserved_fixture(final):
+    for row in rows:
+        if is_model_counted(row) or not selected(row):
             continue
-        group_model = model_log_row_model(final)
-        if model is not None and group_model != model:
-            continue
-        if task_type is not None and model_log_row_task_type(final) != task_type:
-            continue
-        engine = model_log_row_engine(final)
-        key = (final.get("run_family") or "work", engine, group_model)
-        if model_rows:
-            counted.add(key)
-        else:
-            entry = infra.setdefault(key, {"engine": engine, "model": group_model, "infra": {}})
-            for cls, count in model_infra_counts(task_rows).items():
-                entry["infra"][cls] = entry["infra"].get(cls, 0) + count
-    return [infra[key] for key in sorted(infra) if key not in counted]
+        entry = infra.setdefault(key(row), {
+            "engine": model_log_row_engine(row), "model": model_log_row_model(row), "infra": {},
+        })
+        cls = str(row["failure_class"])
+        entry["infra"][cls] = entry["infra"].get(cls, 0) + 1
+    return [infra[k] for k in sorted(infra) if k not in counted]
 
 
 MODEL_SCOREBOARD_RUN_NAME = "model-scoreboard"
@@ -6835,11 +6958,20 @@ class ModelIdentityRegistry:
     defaults: dict[str, str]
     engine_meta: dict[str, ModelIdentity]
     noncanonical_routes: dict[tuple[str, str], NoncanonicalRoute]
+    slug_aliases: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def canonical_model_key(self, engine: str, model: str) -> str:
+        alias = self.slug_aliases.get((engine, model))
+        if alias is not None:
+            return alias
+        if not model.startswith("openrouter/") and (engine, f"openrouter/{model}") in self.identities:
+            return f"openrouter/{model}"
+        return model
 
     def resolve(self, engine: str, model_key: str) -> ModelIdentity:
         engine_key = model_log_text(engine)
         raw_model_key = model_log_text(model_key)
-        lookup_key = raw_model_key or self.defaults.get(engine_key, "")
+        lookup_key = self.canonical_model_key(engine_key, raw_model_key or self.defaults.get(engine_key, ""))
         noncanonical = self.noncanonical_routes.get((engine_key, lookup_key))
         if noncanonical is not None:
             actual_meta = self.engine_meta.get(engine_key)
@@ -6908,6 +7040,7 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
     defaults: dict[str, str] = {}
     engine_meta: dict[str, ModelIdentity] = {}
     pending_noncanonical: list[tuple[str, str, str]] = []
+    slug_aliases: dict[tuple[str, str], str] = {}
     for engine_name, raw_engine in engines_raw.items():
         if not isinstance(raw_engine, dict):
             continue
@@ -6946,6 +7079,14 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
                 source=model_log_text(raw_model.get("source")),
                 last_verified=model_log_text(raw_model.get("last_verified")),
             )
+            raw_aliases = raw_model.get("slug_aliases", [])
+            if not isinstance(raw_aliases, list):
+                raise ValueError(f"invalid slug_aliases for {engine}:{model_key}: {raw_aliases!r}")
+            for value in raw_aliases:
+                alias_engine, separator, alias_model = model_log_text(value).partition(":")
+                if not separator or not alias_engine.strip() or not alias_model.strip():
+                    raise ValueError(f"invalid slug_aliases entry {value!r} for {engine}:{model_key}; expected <engine>:<slug>")
+                slug_aliases[(alias_engine.strip(), alias_model.strip())] = model_key
             raw_noncanonical = raw_model.get("noncanonical_slugs", [])
             if isinstance(raw_noncanonical, list):
                 for value in raw_noncanonical:
@@ -6967,7 +7108,7 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
             canonical_model_key=canonical_model_key,
             identity=canonical_identity,
         )
-    return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes)
+    return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes, slug_aliases)
 
 
 def noncanonical_route_findings(
@@ -7024,7 +7165,9 @@ def row_identity_fields(row: dict[str, Any], registry: ModelIdentityRegistry) ->
         "last_verified": identity.last_verified,
         "unregistered": identity.unregistered,
         "misrouted": identity.misrouted,
-        "identity_key": identity.canonical_model_key or model_log_text(row.get("model")),
+        "identity_key": identity.canonical_model_key or registry.canonical_model_key(
+            model_log_row_engine(row), model_log_text(row.get("model")),
+        ),
         "canonical_route": (
             f"{identity.canonical_engine}:{identity.canonical_model_key} via "
             f"{identity.canonical_harness} on {identity.canonical_access}"
@@ -7060,7 +7203,7 @@ def enrich_model_groups_with_identity(
     catalog_by_id = catalog_models_by_id(catalog_models or [])
     identity_rows: dict[tuple[Any, ...], dict[str, Any]] = {}
     latest: dict[tuple[Any, ...], str] = {}
-    for row in task_final_rows(rows):
+    for row in task_final_rows(canonical_model_log_rows(rows, registry)):
         if model_log_row_is_reserved_fixture(row):
             continue
         group_engine = model_log_row_engine(row)
@@ -8247,9 +8390,12 @@ def aggregate_model_scoreboard_rows(
     task_type: str | None = None,
     model: str | None = None,
     family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
+    rows = canonical_model_log_rows(rows, registry)
     models: dict[tuple[Any, ...], dict[str, Any]] = {}
     all_rows = rows
+    dropped_infra_rows: list[dict[str, Any]] = []
     rows = model_log_family_rows(rows, family)
     effort_keys = model_reasoning_effort_keys([row for row in rows if is_model_counted(row)])
     for task_rows in group_model_log_tasks(rows):
@@ -8261,6 +8407,7 @@ def aggregate_model_scoreboard_rows(
             ),
         )
         if not ordered:
+            dropped_infra_rows.extend(task_rows)
             continue
         first = ordered[0]
         final = ordered[-1]
@@ -8272,7 +8419,9 @@ def aggregate_model_scoreboard_rows(
         run_family = final.get("run_family") or "work"
         unattributed = model_log_row_is_unattributed(final)
         reasoning_effort = None if unattributed else model_log_row_reasoning_effort(final)
-        if model is not None and group_model != model:
+        if model is not None and group_model != (
+            registry.canonical_model_key(model_log_row_engine(final), model) if registry else model
+        ):
             continue
         if task_type is not None and group_task_type != task_type:
             continue
@@ -8301,8 +8450,10 @@ def aggregate_model_scoreboard_rows(
                 "_task_types": {},
             },
         )
-        for cls, count in model_infra_counts(task_rows).items():
-            model_entry["infra"][cls] = model_entry["infra"].get(cls, 0) + count
+        if registry is None:
+            # Preserve historical task-level attribution for callers without a registry.
+            for cls, count in model_infra_counts(task_rows).items():
+                model_entry["infra"][cls] = model_entry["infra"].get(cls, 0) + count
         breakdown = model_entry["_task_types"].setdefault(
             group_task_type,
             {
@@ -8335,6 +8486,10 @@ def aggregate_model_scoreboard_rows(
             if tokens is not None:
                 model_entry["_tokens"].append(tokens)
 
+    add_model_group_infra(
+        models, rows if registry is not None else dropped_infra_rows,
+        include_task_type=False, task_type=task_type,
+    )
     finalized: list[dict[str, Any]] = []
     for entry in models.values():
         tasks_count = int(entry["tasks"])
@@ -8385,7 +8540,7 @@ def aggregate_model_scoreboard_rows(
         )
     if family != "work":
         apply_model_work_tiers(
-            finalized, aggregate_model_scoreboard_rows(all_rows, task_type=task_type, model=model),
+            finalized, aggregate_model_scoreboard_rows(all_rows, task_type=task_type, model=model, registry=registry),
         )
     return finalized
 
@@ -9273,6 +9428,7 @@ def build_models_api_payload(
             identity_registry = dataclass_replace(
                 identity_registry,
                 noncanonical_routes=disk_registry.noncanonical_routes,
+                slug_aliases=disk_registry.slug_aliases,
             )
             catalog_models = db_catalog_models(resolved_db_path)
         except Exception:
@@ -9288,7 +9444,7 @@ def build_models_api_payload(
     notes_sections = parse_model_notes_sections(notes_path)
     groups = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_log_rows(rows, family=family),
+            aggregate_model_log_rows(rows, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=True,
@@ -9298,7 +9454,7 @@ def build_models_api_payload(
     )
     rollup = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_scoreboard_rows(rows, family=family),
+            aggregate_model_scoreboard_rows(rows, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=False,
@@ -9349,6 +9505,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
             identity_registry = dataclass_replace(
                 identity_registry,
                 noncanonical_routes=disk_registry.noncanonical_routes,
+                slug_aliases=disk_registry.slug_aliases,
             )
             skipped = sync_result.skipped
             catalog_models_from_db = db_catalog_models(db_path)
@@ -9367,7 +9524,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     notes_sections = parse_model_notes_sections(notes_path)
     groups = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_log_rows(rows, task_type=args.task_type, model=args.model, family=family),
+            aggregate_model_log_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=True,
@@ -9376,6 +9533,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
         notes_sections,
     )
     if args.explore:
+        # Schema 4's catalog projection omits tool support; the snapshot retains it.
+        if using_db:
+            catalog_models = load_catalog_snapshot(catalog_path)
         print_model_explore(
             log_path=log_path,
             rows_read=len(rows),
@@ -9383,6 +9543,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
             groups=groups,
             catalog_path=catalog_path,
             catalog_models=catalog_models,
+            rows=rows,
+            task_type=args.task_type,
+            registry=identity_registry,
         )
         return 0
     html_arg = getattr(args, "html", None)
@@ -9390,7 +9553,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     if html_arg is not None or open_requested:
         scoreboard_rows = enrich_model_groups_with_notes(
             enrich_model_groups_with_identity(
-                aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model, family=family),
+                aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
                 rows,
                 identity_registry,
                 include_task_type=False,
