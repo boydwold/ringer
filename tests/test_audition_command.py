@@ -78,7 +78,7 @@ class AuditionTests(unittest.TestCase):
     def test_all_tasks_of_missing_type_selected(self):
         other = replace(self.task, key="fix-two")
         review = replace(self.task, key="review", task_type="code-review")
-        rows = [dict(model="acme/a", run_family="audition", task_type="code-review", failure_class="provider_error")]
+        rows = [dict(model="acme/a", run_family="audition", task_type="code-review", failure_class="model")]
         planned, _ = self.plan([model("acme/a")], rows, tasks=[self.task, other, review])
         self.assertEqual([entry.task.key for entry in planned], ["fix", "fix-two"])
 
@@ -307,3 +307,26 @@ class IncludeFreeTests(unittest.TestCase):
         self.assertEqual([e.model for e in plan], ["acme/paid"])
         plan, _ = ringer.plan_auditions([task], models, [], max_models=5, budget=Decimal("10"), spent=Decimal("0"))
         self.assertEqual(len(plan), 2)
+
+
+class SelectionAfterRunTwoTests(unittest.TestCase):
+    """Lessons from the 2026-10-09 audition run that picked ':batch' variants."""
+
+    def test_routing_variants_skipped(self):
+        for mid, variant in [("openai/gpt-oss-20b:batch", True), ("~deepseek/deepseek-v4-flash-latest", True),
+                             ("acme/model:nitro", True), ("acme/model:free", False), ("acme/model", False),
+                             ("openrouter/openai/gpt-oss-20b:batch", True)]:
+            self.assertEqual(ringer.catalog_model_is_routing_variant(mid), variant, mid)
+        task = ringer.AuditionTask("fix", Path("/nonexistent/fix"), "code-fix", "Fix it", ("out.txt",), 10000)
+        models = [model("openai/gpt-oss-20b:batch", price=0.1), model("acme/plain", price=1)]
+        plan, _ = ringer.plan_auditions([task], models, [], max_models=5, budget=Decimal("10"), spent=Decimal("0"))
+        self.assertEqual([e.model for e in plan], ["acme/plain"])
+
+    def test_infrastructure_only_audition_rows_are_not_evidence(self):
+        task = ringer.AuditionTask("fix", Path("/nonexistent/fix"), "code-fix", "Fix it", ("out.txt",), 10000)
+        rows = [{"run_id": "a", "task_key": "fix--acme-plain", "model": "openrouter/acme/plain", "task_type": "code-fix",
+                 "run_family": "audition", "verdict": "FAIL", "failure_class": "provider_error", "model_attempt": None,
+                 "logged_at": "2026-10-01T00:00:00+00:00"}]
+        plan, _ = ringer.plan_auditions([task], [model("acme/plain", price=1)], rows, max_models=5,
+                                        budget=Decimal("10"), spent=Decimal("0"))
+        self.assertEqual([e.model for e in plan], ["acme/plain"], "an outage must not count as audition evidence")

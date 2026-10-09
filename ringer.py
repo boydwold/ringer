@@ -3547,6 +3547,16 @@ def proven_model_group(group: dict[str, Any]) -> bool:
     ) == "proven"
 
 
+def catalog_model_is_routing_variant(model_id: str) -> bool:
+    """A second route to a model listed on its own: ':batch', ':nitro', ':floor'
+    and similar suffixes, or a '~' router alias. ':free' is not a variant here;
+    it is governed by price and the audition include_free setting."""
+    model_id = normalise_model_slug(model_id)
+    if model_id.startswith("~"):
+        return True
+    return ":" in model_id and not model_id.endswith(":free")
+
+
 def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
     try:
         context_length = int(model.get("context_length") or 0)
@@ -3601,6 +3611,7 @@ def catalog_explore_candidates(
         if key(model.get("id", "")) not in tested
         and normalise_model_slug(model.get("id", "")) not in reserved
         and catalog_model_is_text_candidate(model)
+        and not catalog_model_is_routing_variant(model.get("id", ""))
     ]
     price = lambda m: float(m.get("prompt_per_m") or 0) + float(m.get("completion_per_m") or 0)
     by_price = lambda m: (price(m), str(m.get("id") or ""))
@@ -11970,7 +11981,10 @@ def plan_auditions(
     for row in rows:
         model = normalise_model_slug(row.get("model", ""))
         if row.get("run_family") == "audition":
-            evidence.setdefault(model, []).append(row)
+            if is_model_counted(row):
+                # Infrastructure-only rows say nothing about the model; a model
+                # that hit an outage stays eligible for its audition.
+                evidence.setdefault(model, []).append(row)
         try:
             stamp = datetime.fromisoformat(str(row.get("logged_at", "")))
         except ValueError:
@@ -11985,7 +11999,8 @@ def plan_auditions(
     seen = set()
     for model in models:
         mid = normalise_model_slug(model.get("id", ""))
-        if not mid or mid in seen or mid in blocked or not catalog_model_is_text_candidate(model):
+        if (not mid or mid in seen or mid in blocked or catalog_model_is_routing_variant(mid)
+                or not catalog_model_is_text_candidate(model)):
             continue
         if model.get("pricing_unknown"):
             continue
