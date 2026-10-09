@@ -7,10 +7,20 @@ to print the per-model, per-task_type scoreboard (tasks, attempts,
 pass_rate, first_try_pass_rate, median duration/tokens, last_seen). This
 file remains the judgment layer on top of those numbers.
 
-**How to add a row:** after reviewing a run (post-run ritual step 5 in the
-ringer skill), append one dated line under the model. Say the task type,
-what happened, and what you'd do differently. Only write what the executed
-checks and raw logs support — no vibes, no worker self-reports.
+**How to add a row:** this evidence bar is this fork's convention. After
+reviewing a run, add one dated bullet under the model's heading: task type,
+what happened, and what you'd do differently. Include at least one citation:
+
+`[evidence: run=<run_id> task=<task_key> model=<slug> attempt=<n> verdict=<PASS|FAIL|TIMEOUT> type=<task_type> family=<work|audition>]`
+
+Cite only executed-check attempts that are model evidence: PASS or
+`failure_class` `model` (legacy rows with a missing class also qualify).
+Never cite infrastructure failures: `rate_limited`, `provider_error`,
+`quota_exhausted`, `provider_policy`, `sandbox_denied`, or `harness_error`.
+Use the cited model's slug, registry display name, or identity key in the
+heading. Only write what the executed checks and raw logs support — no vibes,
+no worker self-reports. Before committing, run:
+`./ringer.py notes check --base upstream/main --log ~/.ringer/runs.jsonl`.
 
 ## codex (GPT-5-class, own harness)
 

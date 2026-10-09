@@ -394,6 +394,8 @@ Rows that match nothing keep their old `task_type` (empty); rows whose run-state
 
 `docs/MODEL-NOTES.md` is where the human-readable judgment lives on top of these numbers — the scoreboard tells you the pass rates; the notes tell you why a model shines or chokes on a given task shape.
 
+This fork requires evidence citations on new or edited dated notes. Before committing, run `./ringer.py notes check --base upstream/main --log ~/.ringer/runs.jsonl`: it checks each citation against a model-evidence attempt and the model heading. Omit `--log` to check citation format and heading only; use `--notes-file PATH` for another notes file. See the [citation format and evidence rules](docs/MODEL-NOTES.md).
+
 ### Evidence-based routing
 
 The scoreboard only knows models you've already run. To reason about models you *haven't* tried yet, Ringer keeps a local snapshot of the OpenRouter catalog and a change log alongside the runs log:
