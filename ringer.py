@@ -35,12 +35,13 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import asdict, dataclass, field, replace as dataclass_replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import EllipsisType
 from typing import Any, Iterable
 
 
@@ -53,9 +54,22 @@ CONFIG_FILE_NAME = "config.toml"
 DEFAULT_ENGINE_NAME = "codex"
 DEFAULT_TIMEOUT_S = 900
 CHECK_TIMEOUT_S = 60
+FAILURE_CLASSES = frozenset({
+    "model", "rate_limited", "provider_error", "quota_exhausted",
+    "provider_policy", "sandbox_denied", "harness_error",
+})
+INFRA_TRANSIENT_CLASSES = frozenset({"rate_limited", "provider_error"})
+CODEX_FAILURE_RULES = (
+    ("rate_limited", re.compile(r"^ERROR: Selected model is at capacity")),
+    ("provider_error", re.compile(r"^ERROR: Reconnecting\.\.\. (\d+)/\1\s*$")),
+    ("quota_exhausted", re.compile(r"^ERROR: You.ve hit your usage limit")),
+    ("provider_policy", re.compile(r"^ERROR: This content was flagged for possible cybersecurity risk")),
+    ("harness_error", re.compile(r'^ERROR: \{.*"status":\s*400.*is not supported')),
+)
+CODEX_RECONNECT_RE = re.compile(r"^ERROR: Reconnecting\.\.\. \d+/\d+\s*$")
 # The run state file's format. Readers outside Ringer refuse a version they do
 # not know, so bump this whenever a field they read changes meaning or shape.
-STATE_VERSION = 1
+STATE_VERSION = 2
 # A manifest may carry `meta` (run level and per task): an opaque JSON object that
 # Ringer copies into the run state untouched, so outside tools can link a work
 # order to where it came from. Capped so a manifest cannot bloat the state file.
@@ -748,6 +762,8 @@ class EngineConfig:
     # its own "model" — this is what makes a harness engine (OpenCode) model
     # agnostic instead of hard-coding one model into the command line.
     model_default: str = ""
+    failure_profile: str = "none"
+    failure_patterns: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def process_name(self) -> str:
@@ -1066,6 +1082,30 @@ def load_artifact_config(raw: Any, state_dir: Path) -> ArtifactConfig:
 
 
 @dataclass(frozen=True)
+class RetryConfig:
+    infra_max: int = 3
+    infra_base_delay_s: float = 30.0
+    infra_max_delay_s: float = 300.0
+
+
+def load_retry_config(raw: Any) -> RetryConfig:
+    if raw is None:
+        return RetryConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("retry must be a TOML table")
+    infra_max = raw.get("infra_max", 3)
+    if type(infra_max) is not int or infra_max < 0:
+        raise ValueError("retry.infra_max must be an integer >= 0")
+    delays = {}
+    for key, default in (("infra_base_delay_s", 30.0), ("infra_max_delay_s", 300.0)):
+        value = raw.get(key, default)
+        if type(value) not in (int, float) or not 0 <= value < float("inf"):
+            raise ValueError(f"retry.{key} must be a finite number >= 0")
+        delays[key] = float(value)
+    return RetryConfig(infra_max=infra_max, **delays)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     path: Path | None
     identity_default: str | None
@@ -1082,6 +1122,7 @@ class AppConfig:
     engine_bin_diagnostics: tuple[EngineBinDiagnostic, ...] = ()
     hud_listen: tuple[str, ...] = ()
     reuse_open_tab: bool = True
+    retry: RetryConfig = field(default_factory=RetryConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1137,6 +1178,7 @@ class AppConfig:
             artifact=artifact_config,
             steering=steering_config,
             update=update_config,
+            retry=load_retry_config(data.get("retry")),
             engine_bin_diagnostics=engine_bin_diagnostics,
         )
 
@@ -1552,6 +1594,7 @@ def built_in_codex_engine() -> EngineConfig:
         sandbox_args=("--sandbox", "workspace-write"),
         token_regex=DEFAULT_TOKEN_REGEX,
         model_report_regex=DEFAULT_CODEX_MODEL_REPORT_REGEX,
+        failure_profile="codex",
     )
 
 
@@ -1725,6 +1768,27 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         model_default = str(
             section.get("model_default", base.model_default if base else "")
         ).strip()
+        failure_profile = section.get(
+            "failure_profile", clean_name if clean_name in {"codex", "opencode"} else "none"
+        )
+        if failure_profile not in ("codex", "opencode", "none"):
+            raise ValueError(f"engines.{clean_name}.failure_profile must be codex, opencode or none")
+        patterns_key = f"engines.{clean_name}.failure_patterns"
+        raw_patterns = section.get("failure_patterns", {})
+        if not isinstance(raw_patterns, dict):
+            raise ValueError(f"{patterns_key} must be a TOML table")
+        failure_patterns = []
+        for failure_class, patterns in raw_patterns.items():
+            if failure_class not in FAILURE_CLASSES:
+                raise ValueError(f"{patterns_key}: unknown failure class {failure_class!r}")
+            if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+                raise ValueError(f"{patterns_key}.{failure_class} must be a list of regex strings")
+            for pattern in patterns:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(f"{patterns_key}.{failure_class} is invalid: {exc}") from exc
+            failure_patterns.append((failure_class, tuple(patterns)))
         engines[clean_name] = EngineConfig(
             name=clean_name,
             bin=bin_path,
@@ -1734,6 +1798,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             token_regex=token_regex,
             model_report_regex=model_report_regex,
             model_default=model_default,
+            failure_profile=failure_profile,
+            failure_patterns=tuple(failure_patterns),
         )
     return engines
 
@@ -1870,6 +1936,7 @@ class Manifest:
     source_path: Path | None = None
     # Passed through to the run state untouched (see META_MAX_BYTES).
     meta: dict[str, Any] | None = field(default=None, compare=False, hash=False)
+    family: str = "work"
 
     @classmethod
     def from_path(cls, path: Path) -> "Manifest":
@@ -1877,19 +1944,13 @@ class Manifest:
         if not isinstance(data, dict):
             raise ValueError("manifest root must be a JSON object")
         manifest = cls.from_obj(data)
-        return cls(
-            run_name=manifest.run_name,
-            workdir=manifest.workdir,
-            max_parallel=manifest.max_parallel,
-            worktrees=manifest.worktrees,
-            repo=manifest.repo,
-            tasks=manifest.tasks,
-            source_path=path,
-            meta=manifest.meta,
-        )
+        return dataclass_replace(manifest, source_path=path)
 
     @classmethod
     def from_obj(cls, obj: dict[str, Any]) -> "Manifest":
+        family = obj.get("family", "work")
+        if family not in ("work", "audition"):
+            raise ValueError("family must be work or audition")
         run_name = str(obj.get("run_name", "")).strip()
         if not run_name:
             raise ValueError("run_name is required")
@@ -1933,6 +1994,7 @@ class Manifest:
             repo=repo,
             tasks=tasks,
             meta=parse_meta(obj.get("meta"), "manifest"),
+            family=family,
         )
 
     def with_max_parallel(self, value: int | None) -> "Manifest":
@@ -2339,6 +2401,12 @@ class TaskRuntime:
     setup_error: str | None = None
     last_worker_command: list[str] = field(default_factory=list)
     steering: dict[str, Any] | None = None
+    model_attempts: int = 0
+    infra_retries: int = 0
+    end_reason: str | None = None
+    wait_reason: str | None = None
+    wait_s: float | None = None
+    wait_until: str | None = None
 
     def elapsed_s(self, now: float) -> float:
         if self.started_at_monotonic is None:
@@ -2354,6 +2422,7 @@ class WorkerResult:
     tokens: int | None
     error: str | None = None
     reported_model: str | None = None
+    output_tail: str = ""
 
 
 @dataclass(frozen=True)
@@ -2363,6 +2432,115 @@ class VerifyResult:
     check_timed_out: bool
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
+
+
+def opencode_failure_marker(event: Any) -> tuple[str | None, str]:
+    """Read only the error name, status and message, never transport metadata."""
+    if not isinstance(event, dict) or event.get("type") != "error":
+        return None, ""
+    error = event.get("error")
+    if not isinstance(error, dict) or not isinstance(error.get("name"), str):
+        return None, ""
+    name = error["name"]
+    data = error.get("data")
+    data = data if isinstance(data, dict) else {}
+    message = data.get("message", "")
+    message = message if isinstance(message, str) else ""
+    status = data.get("statusCode")
+    prefix = f"{name} {status}" if isinstance(status, (int, str)) else name
+    evidence = f"{prefix}: {message}" if message else prefix
+    failure_class = "provider_error"
+    if name == "APIError":
+        if status == 429:
+            failure_class = "rate_limited"
+        elif status == 402 or "credits" in message.lower():
+            failure_class = "quota_exhausted"
+        elif "matching your guardrail restrictions and data policy" in message.lower():
+            failure_class = "provider_policy"
+    return failure_class, evidence[:300]
+
+
+def classify_failure(
+    worker: WorkerResult,
+    verify: VerifyResult,
+    task: TaskSpec,
+    engine: EngineConfig,
+    manifest: Manifest,
+    taskdir: Path,
+) -> tuple[str | None, str]:
+    """Classify one failed attempt from its captured output and verification."""
+    if verify.ok and not worker.error:
+        return None, ""
+    if worker.error:
+        return "harness_error", worker.error[:300]
+    lines = worker.output_tail.splitlines()
+    for line in lines:
+        if line.startswith("[ringer-sandbox]"):
+            return "harness_error", line[:300]
+    if engine.sandbox_args and not task.full_access and not manifest.worktrees:
+        for path in verify.missing_files:
+            if (
+                (Path(path).is_absolute() or path.startswith("~"))
+                and expect_file_escapes_taskdir(path, manifest.workdir, task.key)
+                and not check_exports_path(task.check, path)
+                and not check_delegates_to_unreadable_script(task.check)
+            ):
+                return "sandbox_denied", (
+                    f"{path} is outside writable root {manifest.workdir / task.key}"
+                )[:300]
+
+    no_deliverables = bool(task.expect_files) and not any(
+        (taskdir / Path(path).expanduser()).exists() for path in task.expect_files
+    )
+    markers: list[tuple[int, str, str]] = []
+    last_engine_line = -1
+    reconnect_line = -1
+    reconnect_evidence = ""
+    for index, line in enumerate(lines):
+        if not line.strip() or line.startswith("[ringer"):
+            continue
+        event = None
+        if engine.failure_profile == "opencode":
+            try:
+                event = json.loads(line)
+            except ValueError:
+                pass
+            if isinstance(event, dict) and "type" in event:
+                last_engine_line = index
+            failure_class, evidence = opencode_failure_marker(event)
+            # Custom rules may match non-error events, but must not expose JSON.
+            evidence = evidence or "opencode marker"
+        else:
+            last_engine_line = index
+            failure_class, evidence = None, line.removeprefix("ERROR: ")
+        override = next((
+            name for name, patterns in engine.failure_patterns
+            if any(re.search(pattern, line) for pattern in patterns)
+        ), None)
+        if override is not None:
+            failure_class = override
+        elif engine.failure_profile == "codex":
+            failure_class = next((
+                name for name, pattern in CODEX_FAILURE_RULES if pattern.search(line)
+            ), None)
+            if failure_class is None and CODEX_RECONNECT_RE.search(line):
+                # Intermediate retries are diagnostics, never provider markers.
+                reconnect_line = index
+                reconnect_evidence = f"non-decisive marker: {evidence}"
+        if failure_class is not None:
+            markers.append((index, failure_class, evidence))
+
+    # Prefer the latest decisive marker when an attempt emits several errors.
+    for index, failure_class, evidence in reversed(markers):
+        if no_deliverables or index == last_engine_line:
+            return failure_class, evidence[:300]
+    if markers:
+        return "model", ("non-decisive marker: " + markers[-1][2])[:300]
+    if verify.check_timed_out:
+        return "model", "check timed out"
+    if reconnect_line >= 0 and reconnect_line < last_engine_line:
+        return "model", reconnect_evidence[:300]
+    return "model", ""
 
 
 class ProcessTree:
@@ -2558,6 +2736,12 @@ class StateWriter:
                     "elapsed_s": round(runtime.elapsed_s(now), 1),
                     "tokens": runtime.tokens,
                     "attempts": runtime.attempts,
+                    "model_attempts": runtime.model_attempts,
+                    "infra_retries": runtime.infra_retries,
+                    "end_reason": runtime.end_reason,
+                    "wait_reason": runtime.wait_reason,
+                    "wait_s": runtime.wait_s,
+                    "wait_until": runtime.wait_until,
                     "children": ProcessTree.count_named_descendants(
                         runtime.worker_pid, children, commands, process_name
                     ),
@@ -2570,7 +2754,7 @@ class StateWriter:
             pass_count = sum(1 for item in tasks if item["status"] == "pass")
             fail_count = sum(1 for item in tasks if item["status"] == "fail")
             running_count = sum(
-                1 for item in tasks if item["status"] in {"running", "verifying", "retrying"}
+                1 for item in tasks if item["status"] in {"running", "verifying", "retrying", "waiting_provider"}
             )
             totals = {
                 "running": running_count,
@@ -3719,6 +3903,7 @@ STATUS_COLORS = {
     "timeout": "var(--fail)",
     "running": "var(--running)",
     "retrying": "var(--running)",
+    "waiting_provider": "var(--running)",
     "verifying": "var(--running)",
     "queued": "var(--waiting)",
     "died": "var(--fail)",
@@ -4684,11 +4869,16 @@ def plain_transition_event(
     status: str,
     task: dict[str, Any],
 ) -> dict[str, str] | None:
-    attempts = int(task.get("attempts") or 0)
+    attempts = int(task.get("model_attempts", task.get("attempts")) or 0)
     timed_out = bool(task.get("check_timed_out")) or status == "timeout"
     check_excerpt = first_check_output_line(task)
     if status == "running" and previous_status in {None, "queued"}:
         return {"line": f"{task_key} started"}
+    if status == "waiting_provider":
+        return {"line": (
+            f"{task_key} is waiting on the provider ({task.get('wait_reason')}), "
+            f"retrying in {task.get('wait_s', 0):g}s"
+        )}
     if status == "retrying":
         if timed_out:
             return {"line": f"{task_key} timed out — trying again"}
@@ -4730,7 +4920,7 @@ def task_state_bucket(status: str) -> str:
         return "pass"
     if status in {"fail", "error", "timeout", "died"}:
         return "fail"
-    if status == "retrying":
+    if status in {"retrying", "waiting_provider"}:
         return "retry"
     if status in {"running", "verifying"}:
         return "working"
@@ -4738,6 +4928,8 @@ def task_state_bucket(status: str) -> str:
 
 
 def task_state_word(status: str) -> str:
+    if status == "waiting_provider":
+        return "waiting on provider"
     bucket = task_state_bucket(status)
     if bucket == "pass":
         return "finished & checked"
@@ -9074,6 +9266,7 @@ class RingerRunner:
                     if runtime.status not in {"pass", "fail"}:
                         runtime.status = "fail"
                         runtime.final_verdict = "ERROR"
+                        runtime.wait_reason = runtime.wait_s = runtime.wait_until = None
                         runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
             self.state_writer.flush()
             final_state = True
@@ -9106,7 +9299,9 @@ class RingerRunner:
                 kill_process_group(proc)
 
     async def _run_task(self, runtime: TaskRuntime) -> None:
-        async with self.semaphore:
+        await self.semaphore.acquire()
+        slot_held = True
+        try:
             with self.lock:
                 runtime.started_at_monotonic = time.monotonic()
             prepared, prepare_error = await self._prepare_taskdir(runtime)
@@ -9114,14 +9309,15 @@ class RingerRunner:
                 await self._record_prepare_error(runtime, prepare_error or "taskdir preparation failed")
                 return
             current_spec = runtime.task.spec
-            max_attempts = runtime.task.max_attempts
-            for attempt in range(1, max_attempts + 1):
-                retrying = attempt > 1
+            retrying = False
+            delay = min(self.config.retry.infra_max_delay_s, self.config.retry.infra_base_delay_s)
+            while True:
                 with self.lock:
-                    runtime.attempts = attempt
+                    runtime.attempts += 1
                     runtime.status = "retrying" if retrying else "running"
+                    runtime.wait_reason = runtime.wait_s = runtime.wait_until = None
                 attempt_started = time.monotonic()
-                worker = await self._run_worker(runtime, current_spec, attempt)
+                worker = await self._run_worker(runtime, current_spec, runtime.attempts)
                 with self.lock:
                     runtime.worker_pid = None
                     runtime.status = "verifying"
@@ -9134,27 +9330,61 @@ class RingerRunner:
                     runtime.last_check_timed_out = verify.check_timed_out
                     runtime.last_check_output = verify.raw_output_excerpt
                 duration_ms = int((time.monotonic() - attempt_started) * 1000)
-                self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
+                failure_class = self._log_attempt(
+                    runtime, current_spec, retrying, worker, verify, verdict, duration_ms
+                )
                 if verdict == "PASS":
                     self._harvest_deliverables_on_pass(runtime)
                     with self.lock:
                         runtime.status = "pass"
                         runtime.final_verdict = verdict
+                        runtime.end_reason = None
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
-                    failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
+                if (
+                    failure_class in INFRA_TRANSIENT_CLASSES
+                    and runtime.infra_retries < self.config.retry.infra_max
+                ):
+                    self.semaphore.release()
+                    slot_held = False
+                    with self.lock:
+                        runtime.infra_retries += 1
+                        runtime.status = "waiting_provider"
+                        runtime.wait_reason = failure_class
+                        runtime.wait_s = delay
+                        runtime.wait_until = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+                    self.state_writer.flush()
+                    event = plain_transition_event(runtime.task.key, "verifying", "waiting_provider", {
+                        "wait_reason": failure_class, "wait_s": delay,
+                    })
+                    print(event["line"], flush=True)
+                    # Cancellation propagates to run(), which records interrupted
+                    # tasks and cleans up workers. No slot is held during sleep.
+                    await asyncio.sleep(delay)
+                    await self.semaphore.acquire()
+                    slot_held = True
+                    delay = min(self.config.retry.infra_max_delay_s, delay * 2)
+                    # Rerun the same spec the provider interrupted: a model retry
+                    # keeps its failure context, a first attempt stays original.
+                    continue
+                if failure_class == "model" and runtime.model_attempts < runtime.task.max_attempts:
+                    failure_context = build_failure_context(worker.output_tail, verify.raw_output_excerpt)
                     current_spec = (
                         f"{runtime.task.spec}\n\n"
                         f"Previous attempt failed: {failure_context}. Fix it."
                     )
+                    retrying = True
                     continue
                 with self.lock:
                     runtime.status = "fail"
-                    runtime.final_verdict = verdict
+                    runtime.final_verdict = "ERROR" if failure_class == "harness_error" else verdict
+                    runtime.end_reason = failure_class
                     runtime.ended_at_monotonic = time.monotonic()
                 return
+        finally:
+            if slot_held:
+                self.semaphore.release()
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
         harvested: list[dict[str, Any]] = []
@@ -9313,6 +9543,7 @@ class RingerRunner:
             runtime.attempts = 1
             runtime.status = "fail"
             runtime.final_verdict = "ERROR"
+            runtime.end_reason = "harness_error"
             runtime.setup_error = error
             runtime.ended_at_monotonic = time.monotonic()
         # The worker log is where every other surface (HUD activity,
@@ -9477,6 +9708,7 @@ class RingerRunner:
             timed_out=timed_out,
             tokens=tokens,
             reported_model=reported_model,
+            output_tail=output_tail,
         )
 
     async def _tee_stream(
@@ -9509,8 +9741,22 @@ class RingerRunner:
         verify: VerifyResult,
         verdict: str,
         duration_ms: int,
-    ) -> None:
+    ) -> str | None:
         engine = self.config.engines.get(runtime.task.engine)
+        failure_class, evidence = (None, "") if verdict == "PASS" else classify_failure(
+            worker, verify, runtime.task, engine or built_in_codex_engine(),
+            self.manifest, runtime.taskdir,
+        )
+        # A timed-out worker can still leave a passing artifact. Its non-PASS
+        # verdict must nevertheless count as a model attempt.
+        if verdict != "PASS" and failure_class is None:
+            failure_class = "model"
+        model_attempt = None
+        if failure_class in {None, "model"}:
+            with self.lock:
+                runtime.model_attempts += 1
+                model_attempt = runtime.model_attempts
+        evidence = failure_evidence_excerpt(evidence)
         resolved_model = resolved_task_model(
             runtime.task,
             engine,
@@ -9536,6 +9782,8 @@ class RingerRunner:
             f"model={stamped_model}",
             f"task_type={runtime.task.task_type}",
         ]
+        if failure_class is not None:
+            notes_parts.append(f"failure_class={failure_class}")
         if worker.error:
             notes_parts.append(f"worker_error={worker.error}")
         if verify.missing_files:
@@ -9546,6 +9794,7 @@ class RingerRunner:
             self._write_steering_observation(
                 runtime,
                 resolved_model=stamped_model,
+                model_attempt=model_attempt,
                 retrying=retrying,
                 worker=worker,
                 verify=verify,
@@ -9576,8 +9825,13 @@ class RingerRunner:
                 "reasoning_effort": reasoning_effort,
                 "task_type": runtime.task.task_type,
                 "retry": retrying,
+                "failure_class": failure_class,
+                "failure_evidence": evidence,
+                "model_attempt": model_attempt,
+                "run_family": self.manifest.family,
             }
         )
+        return failure_class
 
     def _write_steering_observation(
         self,
@@ -9589,6 +9843,7 @@ class RingerRunner:
         verify: VerifyResult,
         verdict: str,
         duration_ms: int,
+        model_attempt: int | None | EllipsisType = ...,
     ) -> None:
         steering_dir = self.config.steering.dir
         if steering_dir is None:
@@ -9624,6 +9879,10 @@ class RingerRunner:
                 "worker_tokens": worker.tokens,
                 "check_excerpt": verify.raw_output_excerpt[:500],
             }
+            # Legacy callers omit accounting and retain the original schema.
+            # _log_attempt always supplies it; explicit None means infrastructure.
+            if model_attempt is not ...:
+                row["model_attempt"] = model_attempt
             path = (
                 steering_dir
                 / "observations"
@@ -10185,8 +10444,22 @@ def looks_like_assistant_text(line: str) -> bool:
     return bool(re.search(r"[A-Za-z]", line))
 
 
-def build_failure_context(log_path: Path, raw_check_output: str) -> str:
-    worker_tail = tail_text(log_path)
+def failure_evidence_excerpt(evidence: str) -> str:
+    """Keep diagnostic text, discarding transport metadata and credentials."""
+    # Classifiers select message fields; custom markers or embedded response
+    # text can still contain headers. Drop that suffix instead of guessing its
+    # shape, including flattened JSON and multi-line header dumps.
+    evidence = re.split(
+        r"(?i)\b(?:[\w-]*headers?|[\w-]*cookies?|authorization|proxy-authorization|"
+        r"cf_bm|__cf_bm|x-[\w-]+|cf-[\w-]+|content-[\w-]+|server|set-cookie)\b\s*[\"']?\s*[:=]",
+        evidence, maxsplit=1,
+    )[0]
+    # A header on its own line need not use a known/sensitive header name.
+    evidence = re.split(r"\n\s*[A-Za-z][A-Za-z0-9_-]*\s*:", evidence, maxsplit=1)[0]
+    return " ".join(evidence.split())[:300]
+
+
+def build_failure_context(worker_tail: str, raw_check_output: str) -> str:
     context = f"{worker_tail}\n{raw_check_output}".strip()
     if len(context) > 6000:
         return context[-6000:]
@@ -10419,7 +10692,7 @@ def print_lint_findings(findings: list[str]) -> None:
 def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
     print("\nSummary")
     print(f"run_id: {run_id}")
-    header = f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} {'tokens':>10} {'elapsed_s':>10}"
+    header = f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} {'model attempts':>14} {'tokens':>10} {'elapsed_s':>10}"
     print(header)
     print("-" * len(header))
     now = time.monotonic()
@@ -10427,8 +10700,9 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
         tokens = "" if runtime.tokens is None else str(runtime.tokens)
         print(
             f"{runtime.task.key:<24} {runtime.status:<8} "
-            f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} "
+            f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} {runtime.model_attempts:>14} "
             f"{tokens:>10} {runtime.elapsed_s(now):>10.1f}"
+            + (f"  (+{runtime.infra_retries} infra retries)" if runtime.infra_retries else "")
         )
     setup_failures = [r for r in runtimes if r.setup_error]
     if setup_failures:
