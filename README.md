@@ -213,7 +213,7 @@ Per-task `"engine": "mymodel"` routes work to it — the invariants (stdin close
 
 Unless a model ships its own first-class harness (Codex does), OpenCode is the harness that runs it — one engine block covers every OpenRouter-served model. `config.sample.toml` includes a ready-to-uncomment engine whose `{model}` placeholder is filled per task from the manifest's `"model"` field, with `model_default` as the fallback. The shipped default is OpenRouter's `z-ai/glm-5.2` — roughly $0.74/M input and $2.33/M output (2026-07), about 20-30x cheaper output than frontier coding models; a complete write-code-and-pass-the-check task lands around a penny.
 
-OpenCode ships no OS sandbox, so the engine's `bin` points at an absolute path to `engines/opencode-sandboxed.sh` (ringer does not resolve engine bins relative to the repo): a macOS Seatbelt wrapper that leaves network and reads open but confines writes to the task dir, a per-run scratch dir (wired as the agent's `TMPDIR`/`XDG_CACHE_HOME`), and OpenCode's own state/config dirs. Its `--dangerously-skip-permissions` flag only silences OpenCode's interactive prompts; Seatbelt is the actual containment. Task paths reach the profile as `sandbox-exec -D` parameters rather than string interpolation, so a task dir with quotes or parens can't inject sandbox rules. `--no-sandbox` is wired as the engine's `full_access_args`, so ringer's `allow_full_access` gate still governs escapes. Non-macOS installs need their own sandbox (or full-access mode).
+OpenCode ships no OS sandbox, so the engine's `bin` points at an absolute path to `engines/opencode-sandboxed.sh` (ringer does not resolve engine bins relative to the repo). The wrapper uses macOS Seatbelt or Linux bubblewrap, allowing network and reads while confining persistent writes to the task dir, a per-run scratch dir (`TMPDIR`/`XDG_CACHE_HOME`), and OpenCode's share/state dirs. `~/.config/opencode` stays read-only. Headless approval flags (`--auto` on OpenCode 1.18.x, `--dangerously-skip-permissions` on older versions) only silence interactive prompts; the wrapper supplies OS containment. On macOS, task and hidden paths reach Seatbelt through `sandbox-exec -D` parameters, so quotes or parens cannot inject profile rules. `--no-sandbox` is wired as the engine's `full_access_args`, so ringer's `allow_full_access` gate still governs escapes. Other platforms fail closed.
 
 Setting it up takes about five minutes:
 
@@ -228,11 +228,20 @@ opencode auth login   # select OpenRouter, paste the key
 
 # 3) In ~/.config/ringer/config.toml, uncomment [engines.opencode] and set
 #    bin to the ABSOLUTE path of engines/opencode-sandboxed.sh in this clone.
-#    (Linux/WSL: the wrapper is macOS-only — set bin to the opencode binary
-#    itself; there is no OS write-confinement then, so keep manifests scoped.)
+#    Linux also requires bwrap and working unprivileged user namespaces.
 ```
 
 Route with per-task `"engine": "opencode"`, pick the model with per-task `"model": "openrouter/<any-model>"`, and set reasoning effort via `engine_args`: `["--variant", "low|high|max"]`. A sensible split: mechanical or tightly-specced tasks on the cheap lane, gnarly ones on your frontier engine — the executed check catches shortfalls either way, and `swarm_runs` rows tell you whether the cheap lane's pass rate holds.
+
+### Linux sandbox
+
+The OpenCode wrapper requires `bwrap` (bubblewrap). It mounts the host filesystem read-only and permits persistent writes only in the task directory, per-run scratch/cache, `~/.local/share/opencode`, and `~/.local/state/opencode`. Scratch is removed when the wrapper exits. Host `/tmp` and `/run/user/$(id -u)` are replaced by private, writable tmpfs mounts, hiding session sockets. Explicit task/scratch/state mounts remain visible; a HOME or executable beneath those temporary locations is restored read-only. The wrapper removes `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `DISPLAY`, `WAYLAND_DISPLAY`, and every `HERDR_*` environment variable. PID/IPC namespaces contain child processes; missing bwrap or failed sandbox setup stops the run.
+
+Set `RINGER_SANDBOX_HIDE=/absolute/secret:/absolute/other` to hide additional paths: existing directories read as empty and regular files read as `/dev/null` on Linux; macOS denies reads through parameterized Seatbelt rules. Entries must be absolute and cannot contain colons. Set `OPENCODE_BIN` to pin an executable (otherwise the wrapper finds `opencode` on PATH), or `RINGER_SANDBOX_BWRAP` to select a bwrap executable. For OpenCode 1.18.x, use `--pure` to skip user plugins and `--auto` for headless approval; see the Linux example in `config.sample.toml`.
+
+For offline checks, run `engines/check-sandboxed.sh <taskdir> <timeout_s> <command...>` (for example, `engines/check-sandboxed.sh "$PWD" 60 bash -c 'make test'`). This Linux-only wrapper permits file writes only in the task directory, masks host temporary paths with private read-only mounts, and disables network with `--unshare-net`. The task directory remains writable even beneath `/tmp`; checks needing temporary files should place them inside it. It passes through the command's exit status and reports timeouts with exit 124, using `timeout --kill-after=5`. It also supports `RINGER_SANDBOX_BWRAP` and fails closed if setup fails.
+
+The OpenCode worker shares the host network namespace so API access, DNS, and local TCP still work. **Abstract Unix sockets remain reachable**, even though filesystem session sockets are hidden; reachable host services remain a containment risk.
 
 ### The plan lane: Grok Build CLI
 

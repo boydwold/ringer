@@ -161,8 +161,9 @@ class OpencodeWrapperLinuxTests(unittest.TestCase):
         )
         r = self.run_wrapped(probe)
         t.join(5)
-        self.assertIn("hello", r.stdout, r.stderr)
-        self.assertIn("dns True", r.stdout)
+        detail = f"rc={r.returncode}\nstdout={r.stdout!r}\nstderr={r.stderr!r}"
+        self.assertIn("hello", r.stdout, detail)
+        self.assertIn("dns True", r.stdout, detail)
 
     def test_no_child_outlives_wrapper(self):
         pidfile = self.taskdir / "child.pid"
