@@ -3028,7 +3028,7 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
         context_length = int(context_length_raw)
     except (TypeError, ValueError):
         context_length = 0
-    return {
+    model = {
         "id": model_id,
         "name": str(raw.get("name", "")).strip() or model_id,
         "context_length": context_length,
@@ -3041,6 +3041,14 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
         "free": is_free,
         "fetched_at": fetched_at,
     }
+
+    if "supported_parameters" in raw:
+        parameters = raw["supported_parameters"]
+        model["supported_parameters"] = (
+            [value for value in parameters if isinstance(value, str)]
+            if isinstance(parameters, list) else []
+        )
+    return model
 
 
 def normalize_catalog_payload(payload: dict[str, Any], *, fetched_at: str) -> list[dict[str, Any]]:
@@ -3452,10 +3460,10 @@ PROVEN_MIN_FIRST_TRY = 2 / 3
 
 
 def proven_model_group(group: dict[str, Any]) -> bool:
-    return (
-        int(group.get("tasks") or 0) >= PROVEN_MIN_TASKS
-        and float(group.get("first_try_pass_rate") or 0) >= PROVEN_MIN_FIRST_TRY
-    )
+    return model_scoreboard_tier(
+        int(group.get("work_tasks", group.get("tasks")) or 0),
+        float(group.get("work_first_try_pass_rate", group.get("first_try_pass_rate")) or 0),
+    ) == "proven"
 
 
 def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
@@ -3467,6 +3475,7 @@ def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
         not bool(model.get("variable_pricing"))
         and str(model.get("modality", "")).strip().lower() == "text->text"
         and context_length >= 32000
+        and ("supported_parameters" not in model or "tools" in (model["supported_parameters"] or []))
     )
 
 
@@ -3489,6 +3498,8 @@ def catalog_explore_candidates(
     tested_models: set[str],
     limit: int = 10,
     priced_slots: int = 4,
+    audition_passed: set[str] | None = None,
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
     """Untested text candidates: mostly free, but always some priced ones.
 
@@ -3497,17 +3508,28 @@ def catalog_explore_candidates(
     most-used coding models on OpenRouter. Reserve `priced_slots` for models that
     cost something so the ladder can actually reach them.
     """
-    tested = {normalise_model_slug(m) for m in tested_models}
+    def key(slug: str) -> str:
+        return normalise_model_slug(registry.canonical_model_key("opencode", slug) if registry else slug)
+
+    tested = {key(m) for m in tested_models}
+    auditioned = {key(m) for m in (audition_passed or set())}
     reserved = {normalise_model_slug(m) for m in RESERVED_FIXTURE_MODELS}
     candidates = [
         model
         for model in catalog_models
-        if normalise_model_slug(model.get("id", "")) not in tested
+        if key(model.get("id", "")) not in tested
         and normalise_model_slug(model.get("id", "")) not in reserved
         and catalog_model_is_text_candidate(model)
     ]
     price = lambda m: float(m.get("prompt_per_m") or 0) + float(m.get("completion_per_m") or 0)
     by_price = lambda m: (price(m), str(m.get("id") or ""))
+    priority = sorted(
+        [m for m in candidates if key(m.get("id", "")) in auditioned],
+        key=lambda m: (not bool(m.get("free")), by_price(m)),
+    )[:limit]
+    candidates = [m for m in candidates if key(m.get("id", "")) not in auditioned]
+    limit -= len(priority)
+    priced_slots = max(0, priced_slots - sum(not bool(m.get("free")) for m in priority))
     free = sorted([m for m in candidates if m.get("free")], key=by_price)
     paid = sorted([m for m in candidates if not m.get("free")], key=by_price)
     take_paid = min(priced_slots, limit, len(paid))
@@ -3516,7 +3538,7 @@ def catalog_explore_candidates(
     if len(picked) < limit:
         rest = [m for m in free + paid if m not in picked]
         picked += sorted(rest, key=by_price)[: limit - len(picked)]
-    return sorted(picked, key=lambda m: (not bool(m.get("free")), by_price(m)))
+    return priority + sorted(picked, key=lambda m: (not bool(m.get("free")), by_price(m)))
 
 
 def print_model_explore(
@@ -3527,6 +3549,9 @@ def print_model_explore(
     groups: list[dict[str, Any]],
     catalog_path: Path,
     catalog_models: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    task_type: str | None = None,
+    registry: ModelIdentityRegistry | None = None,
 ) -> None:
     print(f"TIERS from {log_path} ({rows_read} rows, {skipped} skipped lines)")
     if not groups:
@@ -3551,8 +3576,42 @@ def print_model_explore(
             f"first={group['first_try_pass_rate']:.2f} pass={group['pass_rate']:.2f}"
         )
 
-    tested_models = {str(group.get("model")) for group in groups if group.get("model")}
-    candidates = catalog_explore_candidates(catalog_models, tested_models=tested_models)
+    rows = canonical_model_log_rows(rows, registry)
+    tested_models: set[str] = set()
+    audition_passed: set[str] = set()
+    for row in task_final_rows(rows):
+        if model_log_row_is_unattributed(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        if task_type is not None and model_log_row_task_type(row) != task_type:
+            continue
+        slug = model_log_row_model(row)
+        if (row.get("run_family") or "work") == "work":
+            tested_models.add(slug)
+        elif row.get("run_family") == "audition" and model_log_text(row.get("verdict")).upper() == "PASS":
+            audition_passed.add(slug)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    for row in rows:
+        if model_log_row_is_unattributed(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        try:
+            stamp = datetime.fromisoformat(model_log_text(row.get("logged_at")))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if not cutoff <= stamp <= now:
+            continue
+        slug = normalise_model_slug(model_log_row_model(row))
+        if slug not in latest or stamp >= latest[slug][0]:
+            latest[slug] = (stamp, row)
+    blocked = {slug for slug, (_, row) in latest.items() if row.get("failure_class") == "provider_policy"}
+    candidates = catalog_explore_candidates(
+        catalog_models, tested_models=tested_models | blocked,
+        audition_passed=audition_passed, registry=registry,
+    )
     print(f"CANDIDATES from {catalog_path}")
     if not candidates:
         print("  no untested text->text candidates with context >= 32000")
@@ -3564,6 +3623,11 @@ def print_model_explore(
             f"out={format_catalog_price(model.get('completion_per_m'))}/M "
             f"ctx={int(model.get('context_length') or 0)}{marker}"
         )
+
+    if blocked:
+        print("blocked by provider policy")
+        for slug in sorted(blocked):
+            print(f"  {slug}")
 
 
 def active_runs_path() -> Path:
@@ -6459,13 +6523,44 @@ def median_int(values: list[int]) -> int | None:
     return (ordered[middle - 1] + ordered[middle]) // 2
 
 
-def model_log_task_base_key(row: dict[str, Any]) -> tuple[str, str, str, str, str, bool] | None:
+def is_model_counted(row: dict[str, Any]) -> bool:
+    return (
+        model_log_text(row.get("verdict")).upper() == "PASS"
+        or row.get("failure_class") in (None, "model")
+    )
+
+
+def model_log_has_evidence(row: dict[str, Any]) -> bool:
+    # SQLite preserves field presence separately: NULL also occurs on new PASS rows.
+    return bool(row.get("_model_evidence", "model_attempt" in row or "failure_class" in row))
+
+
+def model_log_family_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
+    if family not in {"work", "audition", "all"}:
+        raise ValueError("family must be work, audition, or all")
+    return [row for row in rows if family == "all" or (row.get("run_family") or "work") == family]
+
+
+def model_infra_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not is_model_counted(row):
+            cls = str(row["failure_class"])
+            counts[cls] = counts.get(cls, 0) + 1
+    return counts
+
+
+def model_log_task_base_key(row: dict[str, Any]) -> tuple[Any, ...] | None:
     run_id = model_log_text(row.get("run_id"))
     task_key = model_log_text(row.get("task_key"))
     if not run_id or not task_key:
         return None
+    family = row.get("run_family") or "work"
+    if model_log_has_evidence(row):
+        return (family, run_id, task_key)
     unattributed = model_log_row_is_unattributed(row)
     return (
+        family,
         run_id,
         task_key,
         model_log_row_model(row),
@@ -6477,10 +6572,14 @@ def model_log_task_base_key(row: dict[str, Any]) -> tuple[str, str, str, str, st
 
 def group_model_log_tasks(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     grouped: list[list[dict[str, Any]]] = []
-    active_by_key: dict[tuple[str, str, str, str, str, bool], int] = {}
+    active_by_key: dict[tuple[Any, ...], int] = {}
     for row in rows:
         key = model_log_task_base_key(row)
-        if key is not None and model_log_row_is_retry(row) and key in active_by_key:
+        if (
+            key is not None
+            and (model_log_has_evidence(row) or model_log_row_is_retry(row))
+            and key in active_by_key
+        ):
             grouped[active_by_key[key]].append(row)
             continue
         grouped.append([row])
@@ -6531,22 +6630,72 @@ def read_model_log_rows(
     return rows, skipped
 
 
+def canonical_model_log_rows(
+    rows: list[dict[str, Any]], registry: ModelIdentityRegistry | None,
+) -> list[dict[str, Any]]:
+    if registry is None:
+        return rows
+    return [
+        dict(row, model=registry.canonical_model_key(
+            model_log_row_engine(row), model_log_text(row.get("model")),
+        )) if not model_log_row_is_unattributed(row) else row
+        for row in rows
+    ]
+
+
+def add_model_group_infra(
+    groups: dict[tuple[Any, ...], dict[str, Any]],
+    rows: list[dict[str, Any]],
+    *,
+    include_task_type: bool,
+    task_type: str | None = None,
+) -> None:
+    """Count infrastructure by its own row identity, including dropped tasks."""
+    for row in rows:
+        if is_model_counted(row) or model_log_row_is_reserved_fixture(row):
+            continue
+        row_task_type = model_log_row_task_type(row)
+        if task_type is not None and row_task_type != task_type:
+            continue
+        unattributed = model_log_row_is_unattributed(row)
+        key = (
+            row.get("run_family") or "work",
+            model_log_row_engine(row), model_log_row_model(row),
+            *((row_task_type,) if include_task_type else ()),
+            "" if unattributed else (model_log_row_reasoning_effort(row) or ""),
+            unattributed,
+        )
+        if key in groups:
+            counts = groups[key]["infra"]
+            cls = str(row["failure_class"])
+            counts[cls] = counts.get(cls, 0) + 1
+
+
 def aggregate_model_log_rows(
     rows: list[dict[str, Any]],
     *,
     task_type: str | None = None,
     model: str | None = None,
+    family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str, bool], dict[str, Any]] = {}
-    effort_keys = model_reasoning_effort_keys(rows)
+    rows = canonical_model_log_rows(rows, registry)
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    all_rows = rows
+    dropped_infra_rows: list[dict[str, Any]] = []
+    rows = model_log_family_rows(rows, family)
+    effort_keys = model_reasoning_effort_keys([row for row in rows if is_model_counted(row)])
     for task_rows in group_model_log_tasks(rows):
         ordered = sorted(
-            task_rows,
+            [row for row in task_rows if is_model_counted(row)],
             key=lambda row: (
                 model_log_text(row.get("logged_at")),
                 1 if model_log_row_is_retry(row) else 0,
             ),
         )
+        if not ordered:
+            dropped_infra_rows.extend(task_rows)
+            continue
         first = ordered[0]
         final = ordered[-1]
         if model_log_row_is_reserved_fixture(final):
@@ -6554,13 +6703,17 @@ def aggregate_model_log_rows(
         group_engine = model_log_row_engine(final)
         group_model = model_log_row_model(final)
         group_task_type = model_log_row_task_type(final)
+        run_family = final.get("run_family") or "work"
         unattributed = model_log_row_is_unattributed(final)
         reasoning_effort = None if unattributed else model_log_row_reasoning_effort(final)
-        if model is not None and group_model != model:
+        if model is not None and group_model != (
+            registry.canonical_model_key(model_log_row_engine(final), model) if registry else model
+        ):
             continue
         if task_type is not None and group_task_type != task_type:
             continue
         key = (
+            run_family,
             group_engine,
             group_model,
             group_task_type,
@@ -6570,6 +6723,8 @@ def aggregate_model_log_rows(
         group = groups.setdefault(
             key,
             {
+                "run_family": run_family,
+                "infra": {},
                 "engine": group_engine,
                 "model": group_model,
                 "task_type": group_task_type,
@@ -6592,6 +6747,10 @@ def aggregate_model_log_rows(
                 "_tokens": [],
             },
         )
+        if registry is None:
+            # Preserve historical task-level attribution for callers without a registry.
+            for cls, count in model_infra_counts(task_rows).items():
+                group["infra"][cls] = group["infra"].get(cls, 0) + count
         group["tasks"] += 1
         group["attempts"] += len(ordered)
         if model_log_text(final.get("verdict")).upper() == "PASS":
@@ -6611,6 +6770,10 @@ def aggregate_model_log_rows(
         if logged_at > group["last_seen"]:
             group["last_seen"] = logged_at
 
+    add_model_group_infra(
+        groups, rows if registry is not None else dropped_infra_rows,
+        include_task_type=True, task_type=task_type,
+    )
     finalized: list[dict[str, Any]] = []
     for group in groups.values():
         tasks_count = group["tasks"]
@@ -6622,6 +6785,8 @@ def aggregate_model_log_rows(
         group["median_tokens"] = median_int(group["_tokens"])
         finalized.append(
             {
+                "run_family": group["run_family"],
+                "infra": group["infra"],
                 "engine": group["engine"],
                 "model": group["model"],
                 "task_type": group["task_type"],
@@ -6639,6 +6804,10 @@ def aggregate_model_log_rows(
                 "last_seen": group["last_seen"],
             }
         )
+    if family != "work":
+        apply_model_work_tiers(
+            finalized, aggregate_model_log_rows(all_rows, task_type=task_type, model=model, registry=registry),
+        )
     return sorted(
         finalized,
         key=lambda item: (
@@ -6651,6 +6820,64 @@ def aggregate_model_log_rows(
             item["reasoning_effort"] or "",
         ),
     )
+
+
+def apply_model_work_tiers(groups: list[dict[str, Any]], work_groups: list[dict[str, Any]]) -> None:
+    def key(group: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(group.get(field) for field in (
+            "engine", "model", "task_type", "reasoning_effort", "unattributed",
+        ))
+
+    work = {key(group): group for group in work_groups}
+    for group in groups:
+        if group["run_family"] == "work":
+            continue
+        evidence = work.get(key(group), {})
+        group["work_tasks"] = int(evidence.get("tasks") or 0)
+        group["work_first_try_pass_rate"] = float(evidence.get("first_try_pass_rate") or 0)
+        group["tier"] = (
+            "unranked" if group["unattributed"] else model_scoreboard_tier(
+                group["work_tasks"], group["work_first_try_pass_rate"],
+            )
+        )
+
+
+def infra_only_models(
+    rows: list[dict[str, Any]],
+    *,
+    task_type: str | None = None,
+    model: str | None = None,
+    family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
+) -> list[dict[str, Any]]:
+    rows = canonical_model_log_rows(rows, registry)
+    rows = model_log_family_rows(rows, family)
+
+    def selected(row: dict[str, Any]) -> bool:
+        canonical_filter = (
+            registry.canonical_model_key(model_log_row_engine(row), model)
+            if registry and model is not None else model
+        )
+        return (
+            not model_log_row_is_reserved_fixture(row)
+            and (model is None or model_log_row_model(row) == canonical_filter)
+            and (task_type is None or model_log_row_task_type(row) == task_type)
+        )
+
+    def key(row: dict[str, Any]) -> tuple[str, str, str]:
+        return (row.get("run_family") or "work", model_log_row_engine(row), model_log_row_model(row))
+
+    counted = {key(row) for row in task_final_rows(rows) if selected(row)}
+    infra: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        if is_model_counted(row) or not selected(row):
+            continue
+        entry = infra.setdefault(key(row), {
+            "engine": model_log_row_engine(row), "model": model_log_row_model(row), "infra": {},
+        })
+        cls = str(row["failure_class"])
+        entry["infra"][cls] = entry["infra"].get(cls, 0) + 1
+    return [infra[k] for k in sorted(infra) if k not in counted]
 
 
 MODEL_SCOREBOARD_RUN_NAME = "model-scoreboard"
@@ -6734,11 +6961,20 @@ class ModelIdentityRegistry:
     defaults: dict[str, str]
     engine_meta: dict[str, ModelIdentity]
     noncanonical_routes: dict[tuple[str, str], NoncanonicalRoute]
+    slug_aliases: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def canonical_model_key(self, engine: str, model: str) -> str:
+        alias = self.slug_aliases.get((engine, model))
+        if alias is not None:
+            return alias
+        if not model.startswith("openrouter/") and (engine, f"openrouter/{model}") in self.identities:
+            return f"openrouter/{model}"
+        return model
 
     def resolve(self, engine: str, model_key: str) -> ModelIdentity:
         engine_key = model_log_text(engine)
         raw_model_key = model_log_text(model_key)
-        lookup_key = raw_model_key or self.defaults.get(engine_key, "")
+        lookup_key = self.canonical_model_key(engine_key, raw_model_key or self.defaults.get(engine_key, ""))
         noncanonical = self.noncanonical_routes.get((engine_key, lookup_key))
         if noncanonical is not None:
             actual_meta = self.engine_meta.get(engine_key)
@@ -6807,6 +7043,7 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
     defaults: dict[str, str] = {}
     engine_meta: dict[str, ModelIdentity] = {}
     pending_noncanonical: list[tuple[str, str, str]] = []
+    slug_aliases: dict[tuple[str, str], str] = {}
     for engine_name, raw_engine in engines_raw.items():
         if not isinstance(raw_engine, dict):
             continue
@@ -6845,6 +7082,14 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
                 source=model_log_text(raw_model.get("source")),
                 last_verified=model_log_text(raw_model.get("last_verified")),
             )
+            raw_aliases = raw_model.get("slug_aliases", [])
+            if not isinstance(raw_aliases, list):
+                raise ValueError(f"invalid slug_aliases for {engine}:{model_key}: {raw_aliases!r}")
+            for value in raw_aliases:
+                alias_engine, separator, alias_model = model_log_text(value).partition(":")
+                if not separator or not alias_engine.strip() or not alias_model.strip():
+                    raise ValueError(f"invalid slug_aliases entry {value!r} for {engine}:{model_key}; expected <engine>:<slug>")
+                slug_aliases[(alias_engine.strip(), alias_model.strip())] = model_key
             raw_noncanonical = raw_model.get("noncanonical_slugs", [])
             if isinstance(raw_noncanonical, list):
                 for value in raw_noncanonical:
@@ -6866,7 +7111,7 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
             canonical_model_key=canonical_model_key,
             identity=canonical_identity,
         )
-    return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes)
+    return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes, slug_aliases)
 
 
 def noncanonical_route_findings(
@@ -6923,7 +7168,9 @@ def row_identity_fields(row: dict[str, Any], registry: ModelIdentityRegistry) ->
         "last_verified": identity.last_verified,
         "unregistered": identity.unregistered,
         "misrouted": identity.misrouted,
-        "identity_key": identity.canonical_model_key or model_log_text(row.get("model")),
+        "identity_key": identity.canonical_model_key or registry.canonical_model_key(
+            model_log_row_engine(row), model_log_text(row.get("model")),
+        ),
         "canonical_route": (
             f"{identity.canonical_engine}:{identity.canonical_model_key} via "
             f"{identity.canonical_harness} on {identity.canonical_access}"
@@ -6937,7 +7184,7 @@ def task_final_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     finals: list[dict[str, Any]] = []
     for task_rows in group_model_log_tasks(rows):
         ordered = sorted(
-            task_rows,
+            [row for row in task_rows if is_model_counted(row)],
             key=lambda row: (
                 model_log_text(row.get("logged_at")),
                 1 if model_log_row_is_retry(row) else 0,
@@ -6959,7 +7206,7 @@ def enrich_model_groups_with_identity(
     catalog_by_id = catalog_models_by_id(catalog_models or [])
     identity_rows: dict[tuple[Any, ...], dict[str, Any]] = {}
     latest: dict[tuple[Any, ...], str] = {}
-    for row in task_final_rows(rows):
+    for row in task_final_rows(canonical_model_log_rows(rows, registry)):
         if model_log_row_is_reserved_fixture(row):
             continue
         group_engine = model_log_row_engine(row)
@@ -6973,6 +7220,7 @@ def enrich_model_groups_with_identity(
             if include_task_type
             else (group_engine, group_model, reasoning_effort, unattributed)
         )
+        key = (row.get("run_family") or "work", *key)
         logged_at = model_log_text(row.get("logged_at"))
         if key not in latest or logged_at >= latest[key]:
             latest[key] = logged_at
@@ -7000,6 +7248,7 @@ def enrich_model_groups_with_identity(
                 bool(group.get("unattributed")),
             )
         )
+        key = (group.get("run_family") or "work", *key)
         item = dict(group)
         item.update(
             identity_rows.get(
@@ -7042,6 +7291,8 @@ def enrich_model_groups_with_identity(
                 "unattributed" if item.get("unattributed") else "model",
             )
         )
+        if item.get("run_family", "work") != "work":
+            item["bucket_id"] += "|" + str(item["run_family"])
         item["display_bucket_id"] = "bucket-" + base64.urlsafe_b64encode(
             item["bucket_id"].encode("utf-8")
         ).decode("ascii").rstrip("=")
@@ -7090,7 +7341,14 @@ def read_model_column_exists(conn: Any, table: str, column: str) -> bool:
     return any(str(row[1]) == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
-def create_read_model_schema(conn: Any) -> None:
+def create_read_model_schema(conn: Any, *, target_version: int = 3) -> None:
+    """Keep the legacy schema API; ingestion explicitly requests evidence schema 4.
+
+    Never downgrade an existing database. Sync checks the stored versions before
+    calling this helper so an old cache is rebuilt from JSONL, not just stamped.
+    """
+    if target_version not in (3, 4):
+        raise ValueError("target_version must be 3 or 4")
     schema_table_exists = read_model_table_exists(conn, "schema_version")
     user_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
     schema_version = None
@@ -7098,7 +7356,8 @@ def create_read_model_schema(conn: Any) -> None:
         row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is not None:
             schema_version = int(row[0])
-    needs_stamp = user_version != 3 or schema_version != 3
+    target_version = max(target_version, user_version, schema_version or 0)
+    needs_stamp = user_version != target_version or schema_version != target_version
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -7177,6 +7436,14 @@ def create_read_model_schema(conn: Any) -> None:
         conn.execute("ALTER TABLE attempts ADD COLUMN reported_model TEXT")
     if not read_model_column_exists(conn, "attempts", "expected_model"):
         conn.execute("ALTER TABLE attempts ADD COLUMN expected_model TEXT")
+    if target_version >= 4:
+        for column, sql_type in (
+            ("failure_class", "TEXT"), ("failure_evidence", "TEXT"),
+            ("model_attempt", "INTEGER"), ("run_family", "TEXT"), ("cost_usd", "REAL"),
+            ("model_evidence", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if not read_model_column_exists(conn, "attempts", column):
+                conn.execute(f"ALTER TABLE attempts ADD COLUMN {column} {sql_type}")
     if not read_model_column_exists(conn, "identity", "lab"):
         conn.execute("ALTER TABLE identity ADD COLUMN lab TEXT")
     if not read_model_column_exists(conn, "identity", "alias"):
@@ -7185,10 +7452,10 @@ def create_read_model_schema(conn: Any) -> None:
         conn.execute("ALTER TABLE identity ADD COLUMN last_verified TEXT")
     if needs_stamp:
         conn.executescript(
-            """
+            f"""
             DELETE FROM schema_version;
-            INSERT INTO schema_version(version) VALUES (3);
-            PRAGMA user_version = 3;
+            INSERT INTO schema_version(version) VALUES ({target_version});
+            PRAGMA user_version = {target_version};
             """
         )
 
@@ -7283,6 +7550,12 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
                 model_log_int(row.get("duration_ms")),
                 model_log_int(row.get("worker_tokens")),
                 model_log_text(row.get("orchestrator")),
+                row.get("failure_class"),
+                row.get("failure_evidence"),
+                model_log_int(row.get("model_attempt")),
+                row.get("run_family") or "work",
+                row.get("cost_usd"),
+                int(model_log_has_evidence(row)),
             )
         )
     if payloads:
@@ -7291,9 +7564,10 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
             INSERT INTO attempts (
                 run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                 reasoning_effort, task_type, retry,
-                verdict, duration_ms, worker_tokens, orchestrator
+                verdict, duration_ms, worker_tokens, orchestrator,
+                failure_class, failure_evidence, model_attempt, run_family, cost_usd, model_evidence
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payloads,
         )
@@ -7509,7 +7783,7 @@ def rebuild_read_model_db(
         conn.execute("BEGIN IMMEDIATE")
         try:
             drop_read_model_tables(conn)
-            create_read_model_schema(conn)
+            create_read_model_schema(conn, target_version=4)
             rows, skipped, offset = read_log_rows_from_offset(log_path, 0)
             inserted = insert_attempt_rows(conn, rows)
             refresh_catalog_tables(conn, catalog_path)
@@ -7540,7 +7814,18 @@ def sync_read_model_db(
     with contextlib.closing(connect_read_model_db(db_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            create_read_model_schema(conn)
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+            schema_version = 0
+            if read_model_table_exists(conn, "schema_version"):
+                version_row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+                if version_row is not None:
+                    schema_version = int(version_row[0])
+            if read_model_table_exists(conn, "attempts") and min(user_version, schema_version) < 4:
+                conn.rollback()
+                return rebuild_read_model_db(
+                    db_path, log_path, catalog_path=catalog_path, registry_path=registry_path,
+                )
+            create_read_model_schema(conn, target_version=4)
             offset = read_sync_state_int(conn, "log_offset", 0)
             if log_size < offset:
                 conn.rollback()
@@ -7607,7 +7892,8 @@ def db_attempt_rows(
         query = """
             SELECT run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                    reasoning_effort, task_type, retry,
-                   verdict, duration_ms, worker_tokens, orchestrator
+                   verdict, duration_ms, worker_tokens, orchestrator,
+                   failure_class, failure_evidence, model_attempt, run_family, cost_usd, model_evidence
             FROM attempts
         """
         params: list[Any] = []
@@ -7631,6 +7917,12 @@ def db_attempt_rows(
                 "duration_ms": row["duration_ms"],
                 "worker_tokens": row["worker_tokens"],
                 "orchestrator": row["orchestrator"],
+                "failure_class": row["failure_class"],
+                "failure_evidence": row["failure_evidence"],
+                "model_attempt": row["model_attempt"],
+                "run_family": row["run_family"] or "work",
+                "cost_usd": row["cost_usd"],
+                "_model_evidence": bool(row["model_evidence"]),
             }
             for row in conn.execute(query, params)
         ]
@@ -8085,8 +8377,7 @@ def catalog_identity_fields(
 
 
 def model_scoreboard_tier(tasks: int, first_try_pass_rate: float) -> str:
-    # Same promotion rule as proven_model_group: volume alone never proves a
-    # model — a 0% pass rate with many tasks is evidence against, not for.
+    # Single promotion rule shared by all scoreboard surfaces.
     if tasks >= PROVEN_MIN_TASKS and first_try_pass_rate >= PROVEN_MIN_FIRST_TRY:
         return "proven"
     return "probation"
@@ -8101,17 +8392,26 @@ def aggregate_model_scoreboard_rows(
     *,
     task_type: str | None = None,
     model: str | None = None,
+    family: str = "work",
+    registry: ModelIdentityRegistry | None = None,
 ) -> list[dict[str, Any]]:
-    models: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
-    effort_keys = model_reasoning_effort_keys(rows)
+    rows = canonical_model_log_rows(rows, registry)
+    models: dict[tuple[Any, ...], dict[str, Any]] = {}
+    all_rows = rows
+    dropped_infra_rows: list[dict[str, Any]] = []
+    rows = model_log_family_rows(rows, family)
+    effort_keys = model_reasoning_effort_keys([row for row in rows if is_model_counted(row)])
     for task_rows in group_model_log_tasks(rows):
         ordered = sorted(
-            task_rows,
+            [row for row in task_rows if is_model_counted(row)],
             key=lambda row: (
                 model_log_text(row.get("logged_at")),
                 1 if model_log_row_is_retry(row) else 0,
             ),
         )
+        if not ordered:
+            dropped_infra_rows.extend(task_rows)
+            continue
         first = ordered[0]
         final = ordered[-1]
         if model_log_row_is_reserved_fixture(final):
@@ -8119,16 +8419,21 @@ def aggregate_model_scoreboard_rows(
         group_engine = model_log_row_engine(final)
         group_model = model_log_row_model(final)
         group_task_type = model_log_row_task_type(final)
+        run_family = final.get("run_family") or "work"
         unattributed = model_log_row_is_unattributed(final)
         reasoning_effort = None if unattributed else model_log_row_reasoning_effort(final)
-        if model is not None and group_model != model:
+        if model is not None and group_model != (
+            registry.canonical_model_key(model_log_row_engine(final), model) if registry else model
+        ):
             continue
         if task_type is not None and group_task_type != task_type:
             continue
-        model_key = (group_engine, group_model, reasoning_effort or "", unattributed)
+        model_key = (run_family, group_engine, group_model, reasoning_effort or "", unattributed)
         model_entry = models.setdefault(
             model_key,
             {
+                "run_family": run_family,
+                "infra": {},
                 "engine": group_engine,
                 "model": group_model,
                 "reasoning_effort": reasoning_effort,
@@ -8148,6 +8453,10 @@ def aggregate_model_scoreboard_rows(
                 "_task_types": {},
             },
         )
+        if registry is None:
+            # Preserve historical task-level attribution for callers without a registry.
+            for cls, count in model_infra_counts(task_rows).items():
+                model_entry["infra"][cls] = model_entry["infra"].get(cls, 0) + count
         breakdown = model_entry["_task_types"].setdefault(
             group_task_type,
             {
@@ -8180,6 +8489,10 @@ def aggregate_model_scoreboard_rows(
             if tokens is not None:
                 model_entry["_tokens"].append(tokens)
 
+    add_model_group_infra(
+        models, rows if registry is not None else dropped_infra_rows,
+        include_task_type=False, task_type=task_type,
+    )
     finalized: list[dict[str, Any]] = []
     for entry in models.values():
         tasks_count = int(entry["tasks"])
@@ -8207,6 +8520,8 @@ def aggregate_model_scoreboard_rows(
         )
         finalized.append(
             {
+                "run_family": entry["run_family"],
+                "infra": entry["infra"],
                 "engine": entry["engine"],
                 "model": entry["model"],
                 "reasoning_effort": entry["reasoning_effort"],
@@ -8225,6 +8540,10 @@ def aggregate_model_scoreboard_rows(
                 "last_seen": entry["last_seen"],
                 "task_types": breakdown_rows,
             }
+        )
+    if family != "work":
+        apply_model_work_tiers(
+            finalized, aggregate_model_scoreboard_rows(all_rows, task_type=task_type, model=model, registry=registry),
         )
     return finalized
 
@@ -9084,6 +9403,7 @@ def build_models_api_payload(
     catalog_path: Path | None = None,
     registry_path: Path | None = None,
     notes_path: Path | None = None,
+    family: str = "work",
 ) -> dict[str, Any]:
     log_path = log_path.expanduser().resolve()
     default_log_path = (default_log_path or log_path).expanduser().resolve()
@@ -9111,6 +9431,7 @@ def build_models_api_payload(
             identity_registry = dataclass_replace(
                 identity_registry,
                 noncanonical_routes=disk_registry.noncanonical_routes,
+                slug_aliases=disk_registry.slug_aliases,
             )
             catalog_models = db_catalog_models(resolved_db_path)
         except Exception:
@@ -9126,7 +9447,7 @@ def build_models_api_payload(
     notes_sections = parse_model_notes_sections(notes_path)
     groups = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_log_rows(rows),
+            aggregate_model_log_rows(rows, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=True,
@@ -9136,7 +9457,7 @@ def build_models_api_payload(
     )
     rollup = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_scoreboard_rows(rows),
+            aggregate_model_scoreboard_rows(rows, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=False,
@@ -9162,6 +9483,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     default_log_path = config.eval.jsonl_path.expanduser().resolve()
     log_path = (args.log or default_log_path).expanduser().resolve()
     since = validate_since_date(args.since)
+    family = getattr(args, "family", "work")
     explicit_db = getattr(args, "db", None) is not None
     db_path = (getattr(args, "db", None) or default_read_model_db_path()).expanduser().resolve()
     catalog_path = (getattr(args, "catalog_file", None) or default_catalog_path()).expanduser().resolve()
@@ -9186,6 +9508,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
             identity_registry = dataclass_replace(
                 identity_registry,
                 noncanonical_routes=disk_registry.noncanonical_routes,
+                slug_aliases=disk_registry.slug_aliases,
             )
             skipped = sync_result.skipped
             catalog_models_from_db = db_catalog_models(db_path)
@@ -9204,7 +9527,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     notes_sections = parse_model_notes_sections(notes_path)
     groups = enrich_model_groups_with_notes(
         enrich_model_groups_with_identity(
-            aggregate_model_log_rows(rows, task_type=args.task_type, model=args.model),
+            aggregate_model_log_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
             rows,
             identity_registry,
             include_task_type=True,
@@ -9213,6 +9536,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
         notes_sections,
     )
     if args.explore:
+        # Schema 4's catalog projection omits tool support; the snapshot retains it.
+        if using_db:
+            catalog_models = load_catalog_snapshot(catalog_path)
         print_model_explore(
             log_path=log_path,
             rows_read=len(rows),
@@ -9220,6 +9546,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
             groups=groups,
             catalog_path=catalog_path,
             catalog_models=catalog_models,
+            rows=rows,
+            task_type=args.task_type,
+            registry=identity_registry,
         )
         return 0
     html_arg = getattr(args, "html", None)
@@ -9227,7 +9556,7 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     if html_arg is not None or open_requested:
         scoreboard_rows = enrich_model_groups_with_notes(
             enrich_model_groups_with_identity(
-                aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model),
+                aggregate_model_scoreboard_rows(rows, task_type=args.task_type, model=args.model, family=family, registry=identity_registry),
                 rows,
                 identity_registry,
                 include_task_type=False,
@@ -11734,6 +12063,10 @@ def build_parser() -> argparse.ArgumentParser:
     models_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     models_parser.add_argument("--log", type=Path, help="path to local eval JSONL log")
     models_parser.add_argument("--db", type=Path, help="path to SQLite read model (default: ~/.ringer/ringer.db)")
+    models_parser.add_argument(
+        "--family", choices=("work", "audition", "all"), default="work",
+        help="run family to include (default: work)",
+    )
     models_parser.add_argument("--task-type", help="only include one task_type bucket")
     models_parser.add_argument("--model", help="only include one resolved model bucket")
     models_parser.add_argument("--engine", help="only include rows from one worker engine")

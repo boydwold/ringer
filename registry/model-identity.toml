@@ -3,6 +3,9 @@
 # Ringside show, and what keeps engine names (codex) from masquerading as
 # model names.
 #
+# slug_aliases: ["<engine>:<slug>", ...] folds spelling variants into this entry.
+# This is separate from alias=true, which means model lineage is unestablished.
+#
 # confidence: "verified" requires a cited source (see source field);
 # "unverified" entries are best current knowledge awaiting the capability
 # research pass. Update via PR — this file is loaded into the local read DB.
@@ -79,6 +82,7 @@ access = "OpenRouter API"
 # their complete raw value appears only in scoreboard diagnostics until verified.
 
 [engines.opencode.models."openrouter/z-ai/glm-5.2"]
+slug_aliases = ["opencode:z-ai/glm-5.2", "opencode:zai/glm-5.2"]
 display = "GLM 5.2"
 lab = "Z.ai (Zhipu AI)"
 confidence = "verified"
