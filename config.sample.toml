@@ -51,6 +51,13 @@ reuse_open_tab = true
 # dir = "~/.ringer/steering"
 # inject_candidates = true
 
+# Provider retries do not consume a task's max_attempts model budget.
+# Waits double from the base delay up to the maximum and release the parallel slot.
+# [retry]
+# infra_max = 3
+# infra_base_delay_s = 30
+# infra_max_delay_s = 300
+
 [eval]
 # Safe public default: write one JSON object per attempt to a local JSONL file.
 # Use "postgres" only when [eval.postgres] is configured.

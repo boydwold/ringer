@@ -109,15 +109,16 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `task_type` | Optional free-form string naming the kind of work this task is, so the model-performance log can slice pass rates by task shape rather than only by model. Suggested vocabulary: `code-feature`, `code-fix`, `code-review`, `test-hardening`, `docs`, `research`, `persona-review`, `copywriting`, `site-build`, `motion-design`, `image-gen`, `data-pipeline`, `format-conversion`, `probe`, `bakeoff`. Empty is allowed; the log just reports it under `(none)`. |
 | `timeout_s` | Per-task kill timer for the worker (default 900) |
 | `check_timeout_s` | Per-task kill timer for the `check` command (default 60). Raise it when the check must run something genuinely slow; the timeout message names this field and lands in the retry prompt |
-| `max_attempts` | How many times this task may run (default 2 — one try plus one retry with the check's failure output injected). Set `1` for a hard no-retry lane |
+| `max_attempts` | Maximum model attempts (default 2 — one try plus one retry with failure context). Set `1` to disable model re-prompts; provider retries still apply |
 | `redact_spec` | Replace this task's spec with `[redacted request packet]` in the run state, the logged command line, and the eval row, for specs carrying sensitive material. Redacts Ringer's own records only — captured worker output is never rewritten (invariant), so a worker that echoes its request still puts that text in `worker.log` |
 | `engine_args` | Extra CLI flags for this task's worker, spliced in at the engine's `{engine_args}` placeholder — e.g. `["-c", "model_reasoning_effort=low"]` so the orchestrator picks reasoning depth per task |
 | `verified` | One plain-English sentence saying what the check proves — shown on the results page next to "finished & checked" |
 | `full_access` | Worker runs unsandboxed — required for workers that spawn their own sub-workers; must also be enabled in config |
+| `family` (run-level) | `"work"` (default) or `"audition"`; recorded as `run_family` on attempt rows |
 | `worktrees` (run-level) | Give each task an isolated git worktree of `repo` so parallel workers can't collide |
 | `meta` (run-level and per task) | Optional JSON object Ringer copies untouched into the run state (`meta` on the run and on each task), so outside tools can link a work order to where it came from — for example `{"openspec": {"change": "add-sso-login", "task": "2.1"}}`. At most 16 KB each; Ringer never reads it |
 
-The run state file (`~/.ringer/runs/<run_id>.json`) carries `state_version` (now `1`). Tools that read it should refuse a version they do not know; it goes up whenever a field they read changes meaning or shape.
+The run state file (`~/.ringer/runs/<run_id>.json`) carries `state_version` (now `2`). Tools that read it should refuse a version they do not know; it goes up whenever a field they read changes meaning or shape.
 
 > **Worktree footgun:** on PASS the task's worktree is removed — including anything written inside it. In worktrees mode, worker logs live outside task worktrees in `workdir/logs/`; have workers write deliverables outside the worktree too, or have your `check` copy artifacts out before it exits 0.
 
@@ -311,6 +312,43 @@ check_interval_s = 3600
 ![Timed, verified, logged](docs/eval-loop.png)
 
 Every worker attempt — pass, fail, timeout, retry — is logged with its spec, engine, duration, token count, and the raw check output. Local JSONL by default; point `[eval.postgres]` at a database to aggregate across machines. Failure rows are the point: they tell you which spec styles, engines, and task shapes actually work, so the swarm gets better on evidence instead of vibes.
+
+## Failure classes and provider retries
+
+Failed attempts have one of seven classes: `model`, `rate_limited`,
+`provider_error`, `quota_exhausted`, `provider_policy`, `sandbox_denied`, or
+`harness_error`. Model failures use the task's `max_attempts` budget and retry
+with that attempt's worker and check output as failure context. Rate limits and
+provider errors retry the original spec without consuming that budget, including
+for `ask` (`max_attempts=1`). The parallel slot is free while the task is
+`waiting_provider`; the terminal and Ringside report the wait. Exhausted provider
+retries and the other four infrastructure classes stop the task immediately.
+
+Optional config settings (defaults shown):
+
+```toml
+[retry]
+infra_max = 3
+infra_base_delay_s = 30
+infra_max_delay_s = 300
+```
+
+`infra_max` is a nonnegative integer counting retries after the initial failure.
+Delays are nonnegative seconds, doubling each time up to `infra_max_delay_s`.
+Signals interrupt the wait through the normal run cancellation path.
+
+Attempt rows add `failure_class` (null on PASS), `failure_evidence` (a sanitized,
+single-line excerpt, at most 300 characters), `model_attempt` (numbered from 1,
+null for infrastructure attempts), and `run_family`. The manifest's optional
+`family` selects `"work"` (default) or `"audition"`. `retry` means the attempt's
+spec included failure context; a provider retry uses `false`. The Postgres sink
+keeps the class only as `failure_class=<class>` in `notes`; JSONL keeps all new
+fields.
+
+State version 2 retains total `attempts` and adds `model_attempts`,
+`infra_retries`, `end_reason`, `wait_reason`, `wait_s`, and `wait_until` (ISO time).
+The summary displays model attempts and any infrastructure retries. Steering
+observations retain total `attempt` and add `model_attempt`.
 
 ## Model performance log
 

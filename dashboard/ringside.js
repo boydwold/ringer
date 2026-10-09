@@ -69,7 +69,7 @@
     String(task.key || task.task_key || `task-${i + 1}`);
   function kind(task, run) {
     const s = String(task.status || task.state || "").toLowerCase();
-    if (s === "retrying" || s === "redoing")
+    if (s === "retrying" || s === "redoing" || s === "waiting_provider")
       return run?.state === "died" ? "fail" : "retry";
     if (["running", "working", "verifying"].includes(s))
       return run?.state === "died" ? "fail" : "working";
@@ -84,17 +84,21 @@
   }
   const label = (task, run) =>
     run?.state === "died" &&
-    ["running", "working", "verifying", "retrying", "redoing"].includes(
+    ["running", "working", "verifying", "retrying", "redoing", "waiting_provider"].includes(
       task.status,
     )
       ? "Stopped"
       : {
           pass: "Passed",
-          retry: "Retrying",
+          retry: task.status === "waiting_provider" ? "Waiting on provider" : "Retrying",
           working: task.status === "verifying" ? "Checking" : "Working",
           fail: "Failed",
           waiting: "Waiting",
         }[kind(task, run)];
+  const retryMessage = (task) =>
+    task.status === "waiting_provider"
+      ? `<p class="retry">Waiting on the provider (${esc(task.wait_reason || "provider error")}), retrying in ${num(task.wait_s)}s.</p>`
+      : '<p class="retry">This task is retrying. Its failed check stays visible.</p>';
   const attention = (run) =>
     Math.max(
       run.state === "died" ? 1 : 0,
@@ -303,13 +307,13 @@
       return;
     }
     const k = kind(task, run),
-      attempts = num(task.attempts);
+      attempts = num(task.model_attempts ?? task.attempts);
     const result = state.artifacts.find(
       (a) => a.current_run_id === run.run_id || a.name === run.run_name,
     );
     replace(
       $("task-inspector"),
-      `<p class="section-label">Selected task</p><h3>${esc(keyOf(task, run.tasks.indexOf(task)))}</h3>${badge(`${label(task, run)}${attempts ? ` · attempt ${attempts}${task.max_attempts ? ` of ${task.max_attempts}` : ""}` : ""}`, k)}${checkHTML(task)}${k === "retry" ? '<p class="retry">This task is retrying. Its failed check stays visible.</p>' : ""}<p class="meta">${esc(task.engine || "Unknown harness")} · ${esc(task.model || "Model not reported")} · ${esc(duration(task.elapsed_s))}</p>${task.activity && ["working", "retry"].includes(k) ? `<p class="meta">${esc(task.activity)}</p>` : ""}<div class="inspector-actions"><button data-action="logs" data-focus="logs">View logs</button><button data-action="result" data-focus="result" ${result ? "" : "disabled"}>Open result</button></div><details data-detail="${esc(run.run_id)}:${esc(keyOf(task))}"><summary>Task brief &amp; check</summary><p>${esc(task.spec || task.spec_short || "No brief reported.")}</p><pre class="check-output">${esc(task.check || "No check reported.")}</pre>${task.verified ? `<p class="meta">${esc(task.verified)}</p>` : ""}</details>`,
+      `<p class="section-label">Selected task</p><h3>${esc(keyOf(task, run.tasks.indexOf(task)))}</h3>${badge(`${label(task, run)}${attempts ? ` · attempt ${attempts}${task.max_attempts ? ` of ${task.max_attempts}` : ""}` : ""}`, k)}${checkHTML(task)}${k === "retry" ? retryMessage(task) : ""}<p class="meta">${esc(task.engine || "Unknown harness")} · ${esc(task.model || "Model not reported")} · ${esc(duration(task.elapsed_s))}</p>${task.activity && ["working", "retry"].includes(k) ? `<p class="meta">${esc(task.activity)}</p>` : ""}<div class="inspector-actions"><button data-action="logs" data-focus="logs">View logs</button><button data-action="result" data-focus="result" ${result ? "" : "disabled"}>Open result</button></div><details data-detail="${esc(run.run_id)}:${esc(keyOf(task))}"><summary>Task brief &amp; check</summary><p>${esc(task.spec || task.spec_short || "No brief reported.")}</p><pre class="check-output">${esc(task.check || "No check reported.")}</pre>${task.verified ? `<p class="meta">${esc(task.verified)}</p>` : ""}</details>`,
     );
   }
   function showView(view) {
@@ -724,7 +728,7 @@
       $("log-check"),
       checkHTML(t) +
         (kind(t, r) === "retry"
-          ? '<p class="retry">This task is retrying. Its failed check stays visible.</p>'
+          ? retryMessage(t)
           : ""),
     );
   }
