@@ -66,6 +66,7 @@ CODEX_FAILURE_RULES = (
     ("provider_policy", re.compile(r"^ERROR: This content was flagged for possible cybersecurity risk")),
     ("harness_error", re.compile(r'^ERROR: \{.*"status":\s*400.*is not supported')),
 )
+OPENCODE_DB_LOCKED_RE = re.compile(r"^\s*(?:SQLITE_BUSY\b.*|database is locked)\s*$")
 CODEX_RECONNECT_RE = re.compile(r"^ERROR: Reconnecting\.\.\. \d+/\d+\s*$")
 # The run state file's format. Readers outside Ringer refuse a version they do
 # not know, so bump this whenever a field they read changes meaning or shape.
@@ -2582,6 +2583,10 @@ def classify_failure(
             if isinstance(event, dict) and "type" in event:
                 last_engine_line = index
             failure_class, evidence = opencode_failure_marker(event)
+            if event is None and OPENCODE_DB_LOCKED_RE.search(line):
+                # opencode's own SQLite store was busy (parallel workers share
+                # it); opencode crashed before or while running the model.
+                failure_class, evidence = "harness_error", "opencode: database is locked"
             # Custom rules may match non-error events, but must not expose JSON.
             evidence = evidence or "opencode marker"
         else:

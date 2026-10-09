@@ -286,3 +286,24 @@ class SandboxMarkerPositionTests(unittest.TestCase):
     def test_marker_first_is_harness_error(self):
         out = "[ringer.py] attempt 1 started\n[ringer-sandbox] bwrap not found\n"
         self.assertEqual(self._case(out)[0], "harness_error")
+
+
+class OpencodeDatabaseLockedTests(unittest.TestCase):
+    """Real opencode output from a 2026-10-09 audition run with two parallel workers."""
+
+    def test_database_locked_is_harness_error(self):
+        engine = ringer.load_engines({"opencode": {"bin": "x", "args_template": ["{spec}"], "full_access_args": ["--no-sandbox"]}})["opencode"]
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "t1").mkdir()
+            task = ringer.TaskSpec(key="t1", spec="x" * 80, check="test -s paginate.py", engine="opencode", expect_files=("report.md",))
+            manifest = ringer.Manifest(run_name="r", workdir=workdir, max_parallel=1, worktrees=False, repo=None, tasks=(task,))
+            out = "[ringer.py] attempt 1 started\n\x1b[91m\x1b[1mError: \x1b[0mUnexpected error\ndatabase is locked\n[ringer.py] attempt 1 exited rc=1\n"
+            worker = ringer.WorkerResult(returncode=1, timed_out=False, tokens=None, output_tail=out)
+            verify = ringer.VerifyResult(ok=False, check_returncode=1, check_timed_out=False, raw_output_excerpt="", missing_files=("report.md",))
+            cls, evidence = ringer.classify_failure(worker, verify, task, engine, manifest, workdir / "t1")
+            self.assertEqual(cls, "harness_error")
+            self.assertIn("database is locked", evidence)
+
+    def test_model_prose_mentioning_lock_is_not_matched(self):
+        self.assertIsNone(ringer.OPENCODE_DB_LOCKED_RE.search("the database is locked when two writers race, so add a retry"))
