@@ -1,0 +1,5 @@
+key = "review-inventory"
+title = "Review stock and persistence behaviour"
+task_type = "code-review"
+expect_files = ["report.md"]
+token_estimate = 30000

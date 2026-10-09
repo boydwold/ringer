@@ -1,0 +1,5 @@
+key = "review-auth-guard"
+title = "Review authentication and permission guards"
+task_type = "code-review"
+expect_files = ["report.md"]
+token_estimate = 35000

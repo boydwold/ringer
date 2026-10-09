@@ -1,0 +1,3 @@
+- inventory.py:4 The default history list is reused across calls, so independent inventories share reservation records; create a fresh list when history is omitted.
+- inventory.py:12 Comparing stock to quantity minus one allows reserving one unit more than is available, leaving negative stock.
+- storage.py:8-9 The OSError handler discards write failures, making an unsuccessful save appear successful instead of propagating the error.

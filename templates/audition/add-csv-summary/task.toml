@@ -1,0 +1,5 @@
+key = "add-csv-summary"
+title = "Implement CSV column summaries"
+task_type = "code-feature"
+expect_files = ['summary.py']
+token_estimate = 35000

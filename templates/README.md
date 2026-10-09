@@ -6,6 +6,7 @@ A kit is a reusable Ringer starter: a manifest skeleton, check skeletons, and a 
 
 | Kit | What it does | Reach for it when | Status |
 |---|---|---|---|
+| `audition` | Six small, executable model auditions for code fixes, features and reviews. | You need comparable behavioural evidence across OpenRouter models. | Implemented with reference and negative checks |
 | `review-swarm` | Runs N read-only scouts, one surface each, with structured findings. | You need broad review coverage before deciding what to fix. | Proven in a recorded run |
 | `fix-swarm` | Runs N isolated workers in worktrees to apply independent fixes, then exports patches. | You have confirmed fixes that can be split by file or surface. | Proven in a recorded run |
 | `focus-group` | Runs isolated persona workers against a product, pitch, prompt, or workflow and collects parseable verdicts. | You need product or messaging feedback without persona bleed. | Proven in a recorded run |
