@@ -1117,6 +1117,9 @@ class AuditionConfig:
     engine: str = "opencode"
     set_dir: Path = Path(__file__).resolve().parent / "templates" / "audition"
     check_timeout_s: int = 120
+    # False skips ":free"/zero-price models, for accounts whose OpenRouter
+    # privacy settings block free endpoints (they would all fail provider_policy).
+    include_free: bool = True
 
 
 def load_audition_config(raw: Any) -> AuditionConfig:
@@ -1136,6 +1139,10 @@ def load_audition_config(raw: Any) -> AuditionConfig:
         if type(value) is not int or value <= 0:
             raise ValueError(f"audition.{key} must be an integer > 0")
         values[key] = value
+    if "include_free" in raw:
+        if type(raw["include_free"]) is not bool:
+            raise ValueError("audition.include_free must be true or false")
+        values["include_free"] = raw["include_free"]
     for key in ("credential_file", "set_dir", "engine"):
         if key not in raw:
             continue
@@ -11912,7 +11919,7 @@ def audition_spent(path: Path, week: str) -> Decimal:
 
 def plan_auditions(
     tasks: list[AuditionTask], models: list[dict[str, Any]], rows: list[dict[str, Any]],
-    *, max_models: int, budget: Decimal, spent: Decimal,
+    *, max_models: int, budget: Decimal, spent: Decimal, include_free: bool = True,
 ) -> tuple[list[AuditionPlanEntry], list[AuditionPlanEntry]]:
     evidence: dict[str, list[dict[str, Any]]] = {}
     latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -11938,6 +11945,8 @@ def plan_auditions(
         if not mid or mid in seen or mid in blocked or not catalog_model_is_text_candidate(model):
             continue
         if model.get("pricing_unknown"):
+            continue
+        if not include_free and model.get("free"):
             continue
         prompt = audition_cost(model.get("prompt_per_m"))
         completion = audition_cost(model.get("completion_per_m"))
@@ -12105,6 +12114,7 @@ def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
         plan, skipped = plan_auditions(
             load_audition_tasks(audition), models, rows, max_models=max_models,
             budget=budget, spent=audition_spent(ledger, audition_week()),
+            include_free=audition.include_free,
         )
         for entry in plan:
             print(f"PLAN {entry.key} openrouter/{entry.model} est=${entry.estimate:.6f}")

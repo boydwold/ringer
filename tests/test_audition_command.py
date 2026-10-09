@@ -290,3 +290,20 @@ class AuditionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncludeFreeTests(unittest.TestCase):
+    def test_config_flag(self):
+        self.assertTrue(ringer.load_audition_config({}).include_free)
+        self.assertFalse(ringer.load_audition_config({"include_free": False}).include_free)
+        with self.assertRaises(ValueError):
+            ringer.load_audition_config({"include_free": "no"})
+
+    def test_planner_skips_free_when_excluded(self):
+        task = ringer.AuditionTask("fix", Path("/nonexistent/fix"), "code-fix", "Fix it", ("out.txt",), 10000)
+        models = [model("acme/free:free", price=0, free=True), model("acme/paid", price=1)]
+        plan, _ = ringer.plan_auditions([task], models, [], max_models=5, budget=Decimal("10"), spent=Decimal("0"),
+                                        include_free=False)
+        self.assertEqual([e.model for e in plan], ["acme/paid"])
+        plan, _ = ringer.plan_auditions([task], models, [], max_models=5, budget=Decimal("10"), spent=Decimal("0"))
+        self.assertEqual(len(plan), 2)
