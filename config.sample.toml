@@ -58,6 +58,17 @@ reuse_open_tab = true
 # infra_base_delay_s = 30
 # infra_max_delay_s = 300
 
+# Optional scheduled model auditions; only audition requires budget and key.
+# [audition]
+# weekly_budget_usd = 5.0
+# credential_file = "~/.config/ringer/audition.key"
+# max_models = 5
+# token_estimate = 40000
+# concurrency = 2
+# engine = "opencode"
+# set_dir = "/absolute/path/to/ringer/templates/audition" # default: bundled set
+# check_timeout_s = 120
+
 [eval]
 # Safe public default: write one JSON object per attempt to a local JSONL file.
 # Use "postgres" only when [eval.postgres] is configured.

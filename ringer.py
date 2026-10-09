@@ -1108,6 +1108,45 @@ def load_retry_config(raw: Any) -> RetryConfig:
 
 
 @dataclass(frozen=True)
+class AuditionConfig:
+    weekly_budget_usd: float | None = None
+    credential_file: Path | None = None
+    max_models: int = 5
+    token_estimate: int = 40000
+    concurrency: int = 2
+    engine: str = "opencode"
+    set_dir: Path = Path(__file__).resolve().parent / "templates" / "audition"
+    check_timeout_s: int = 120
+
+
+def load_audition_config(raw: Any) -> AuditionConfig:
+    if raw is None:
+        return AuditionConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("audition must be a TOML table")
+    values: dict[str, Any] = {}
+    budget = raw.get("weekly_budget_usd")
+    if budget is not None:
+        if type(budget) not in (int, float) or not 0 < budget < float("inf"):
+            raise ValueError("audition.weekly_budget_usd must be a finite number > 0")
+        values["weekly_budget_usd"] = float(budget)
+    defaults = AuditionConfig()
+    for key in ("max_models", "token_estimate", "concurrency", "check_timeout_s"):
+        value = raw.get(key, getattr(defaults, key))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"audition.{key} must be an integer > 0")
+        values[key] = value
+    for key in ("credential_file", "set_dir", "engine"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"audition.{key} must be a non-empty string")
+        values[key] = value.strip() if key == "engine" else Path(value).expanduser().resolve()
+    return AuditionConfig(**values)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     path: Path | None
     identity_default: str | None
@@ -1125,6 +1164,7 @@ class AppConfig:
     hud_listen: tuple[str, ...] = ()
     reuse_open_tab: bool = True
     retry: RetryConfig = field(default_factory=RetryConfig)
+    audition: AuditionConfig = field(default_factory=AuditionConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1181,6 +1221,7 @@ class AppConfig:
             steering=steering_config,
             update=update_config,
             retry=load_retry_config(data.get("retry")),
+            audition=load_audition_config(data.get("audition")),
             engine_bin_diagnostics=engine_bin_diagnostics,
         )
 
@@ -2492,9 +2533,14 @@ def classify_failure(
     if worker.error:
         return "harness_error", worker.error[:300]
     lines = worker.output_tail.splitlines()
+    # The sandbox wrapper prints [ringer-sandbox] before the engine starts, so
+    # it only counts when no engine output precedes it. Later occurrences are
+    # tool output (e.g. a worker running the wrapper's tests) and prove nothing.
     for line in lines:
         if line.startswith("[ringer-sandbox]"):
             return "harness_error", line[:300]
+        if line.strip() and not line.startswith("[ringer"):
+            break
     # Sandboxed: explicit sandbox args (codex), or a wrapper that sandboxes by
     # default and has a full-access switch to turn it off (opencode wrapper).
     sandboxed = bool(engine.sandbox_args) or bool(engine.full_access_args)
@@ -9846,7 +9892,7 @@ class RingerRunner:
             self.state_writer.start()
             if self.dashboard is not None:
                 self.state_writer.set_port(self.dashboard.start())
-            await asyncio.gather(*(self._run_task(runtime) for runtime in self.runtimes))
+            await self._run_tasks()
             final_state = True
             return 0 if all(runtime.status == "pass" for runtime in self.runtimes) else 1
         except asyncio.CancelledError:
@@ -9877,6 +9923,9 @@ class RingerRunner:
                     results_page = artifact_live_path(self.state_writer.state_dir, self.manifest.run_name)
                     print(f"\nYour results: {results_page}")
                     print("Open it in a browser, or run './ringer.py hud' for the full Ringside view (http://127.0.0.1:8700).")
+
+    async def _run_tasks(self) -> None:
+        await asyncio.gather(*(self._run_task(runtime) for runtime in self.runtimes))
 
     async def kill_all_workers(self) -> None:
         procs = list(self.active_processes.values())
@@ -11773,14 +11822,334 @@ def uninstall_agent(project: bool = False) -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class AuditionTask:
+    key: str
+    directory: Path
+    task_type: str
+    spec: str
+    expect_files: tuple[str, ...]
+    token_estimate: int
+
+
+@dataclass(frozen=True)
+class AuditionPlanEntry:
+    task: AuditionTask
+    model: str
+    estimate: Decimal
+
+    @property
+    def key(self) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", self.model.lower()).strip("-")
+        return f"{self.task.key}--{slug}"
+
+
+def load_audition_tasks(config: AuditionConfig) -> list[AuditionTask]:
+    tasks = []
+    for path in sorted(config.set_dir.glob("*/task.toml")):
+        with path.open("rb") as fh:
+            raw = tomllib.load(fh)
+        key = raw.get("key")
+        if key != path.parent.name or not re.fullmatch(r"[a-zA-Z0-9_-]+", str(key)):
+            raise ValueError(f"{path}: key must match its directory name")
+        task_type = raw.get("task_type")
+        if not isinstance(task_type, str) or not task_type.strip():
+            raise ValueError(f"{path}: task_type is required")
+        tokens = raw.get("token_estimate", config.token_estimate)
+        if type(tokens) is not int or tokens <= 0:
+            raise ValueError(f"{path}: token_estimate must be an integer > 0")
+        expect = raw.get("expect_files", [])
+        if not isinstance(expect, list) or any(
+            not isinstance(item, str) or not item or Path(item).is_absolute()
+            or ".." in Path(item).parts for item in expect
+        ):
+            raise ValueError(f"{path}: expect_files must contain relative file paths")
+        if not (path.parent / "fixture").is_dir() or not (path.parent / "check.py").is_file():
+            raise ValueError(f"{path}: fixture/ and check.py are required")
+        spec = (path.parent / "spec.md").read_text(encoding="utf-8")
+        if not spec.strip():
+            raise ValueError(f"{path}: spec.md must not be empty")
+        tasks.append(AuditionTask(key, path.parent.resolve(), task_type, spec, tuple(expect), tokens))
+    if not tasks:
+        raise ValueError(f"audition.set_dir contains no tasks: {config.set_dir}")
+    return tasks
+
+
+def audition_week() -> str:
+    year, week, _ = datetime.now().astimezone().isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def audition_cost(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        cost = Decimal(str(value))
+        return cost if cost.is_finite() and cost >= 0 else None
+    except InvalidOperation:
+        return None
+
+
+def audition_spent(path: Path, week: str) -> Decimal:
+    # Refuse a damaged ledger rather than silently understating money spent.
+    if not path.exists():
+        return Decimal(0)
+    total = Decimal(0)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            cost = audition_cost(row["cost_usd"])
+            if cost is None or not isinstance(row["week"], str):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError):
+            raise ValueError(f"invalid audition spend ledger: {path}") from None
+        if row["week"] == week:
+            total += cost
+    return total
+
+
+def plan_auditions(
+    tasks: list[AuditionTask], models: list[dict[str, Any]], rows: list[dict[str, Any]],
+    *, max_models: int, budget: Decimal, spent: Decimal,
+) -> tuple[list[AuditionPlanEntry], list[AuditionPlanEntry]]:
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        model = normalise_model_slug(row.get("model", ""))
+        if row.get("run_family") == "audition":
+            evidence.setdefault(model, []).append(row)
+        try:
+            stamp = datetime.fromisoformat(str(row.get("logged_at", "")))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if now - timedelta(days=7) <= stamp <= now:
+            if model not in latest or stamp >= latest[model][0]:
+                latest[model] = (stamp, row)
+    blocked = {model for model, (_, row) in latest.items() if row.get("failure_class") == "provider_policy"}
+    candidates = []
+    seen = set()
+    for model in models:
+        mid = normalise_model_slug(model.get("id", ""))
+        if not mid or mid in seen or mid in blocked or not catalog_model_is_text_candidate(model):
+            continue
+        if model.get("pricing_unknown"):
+            continue
+        prompt = audition_cost(model.get("prompt_per_m"))
+        completion = audition_cost(model.get("completion_per_m"))
+        if prompt is None or completion is None:
+            continue
+        seen.add(mid)
+        prior = evidence.get(mid, [])
+        types = {row.get("task_type") for row in prior}
+        remaining = [task for task in tasks if task.task_type not in types]
+        if not remaining:
+            continue
+        price = Decimal(0) if model.get("free") else Decimal("0.85") * prompt + Decimal("0.15") * completion
+        costs = sorted(cost for row in prior if (cost := audition_cost(row.get("cost_usd"))) is not None)
+        median = None
+        if costs:
+            middle = len(costs) // 2
+            median = (costs[middle] + costs[~middle]) / 2
+        candidates.append((len(prior), price, mid, remaining, median, bool(model.get("free"))))
+    candidates.sort(key=lambda candidate: candidate[:3])
+    planned, skipped = [], []
+    committed = spent
+    for _, price, mid, remaining, median, free in candidates[:max_models]:
+        for task in remaining:
+            estimate = Decimal(0) if free else (
+                median if median is not None else Decimal(task.token_estimate) * price / 1000000
+            )
+            entry = AuditionPlanEntry(task, mid, estimate)
+            if committed + estimate <= budget:
+                planned.append(entry)
+                committed += estimate
+            else:
+                skipped.append(entry)
+    keys = [entry.key for entry in planned]
+    if len(keys) != len(set(keys)):
+        raise ValueError("audition model IDs produce duplicate task keys")
+    return planned, skipped
+
+
+@contextlib.contextmanager
+def audition_environment(config: AuditionConfig, credential: str) -> Iterable[None]:
+    names = ("RINGER_SANDBOX_HIDE", "OPENCODE_CONFIG_CONTENT")
+    old = {name: os.environ.get(name) for name in names}
+    try:
+        content = json.loads(old["OPENCODE_CONFIG_CONTENT"] or "{}")
+        content.setdefault("provider", {}).setdefault("openrouter", {}).setdefault("options", {})["apiKey"] = credential
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("OPENCODE_CONFIG_CONTENT must be a JSON object with provider options objects") from None
+    try:
+        os.environ["RINGER_SANDBOX_HIDE"] = ":".join(filter(None, (old["RINGER_SANDBOX_HIDE"], str(config.set_dir))))
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(content)
+        yield
+    finally:
+        for name, value in old.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def audition_manifest(plan: list[AuditionPlanEntry], config: AuditionConfig, workdir: Path) -> Manifest:
+    checker = Path(__file__).resolve().parent / "engines" / "check-sandboxed.sh"
+    tasks = tuple(TaskSpec(
+        key=entry.key, engine=config.engine, model=f"openrouter/{entry.model}",
+        spec=entry.task.spec, task_type=entry.task.task_type, expect_files=entry.task.expect_files,
+        max_attempts=1, check_timeout_s=config.check_timeout_s + 10,
+        check=shlex.join([str(checker), str(workdir / entry.key), str(config.check_timeout_s),
+                          os.path.realpath(sys.executable), "-I", str(entry.task.directory / "check.py")]),
+    ) for entry in plan)
+    return Manifest("audition", workdir, config.concurrency, False, None, tasks, family="audition")
+
+
+class AuditionRunner(RingerRunner):
+    def __init__(self, *args: Any, plan: list[AuditionPlanEntry], ledger: Path, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.plan = {entry.key: entry for entry in plan}
+        self.ledger = ledger
+        self.audition_rows: list[dict[str, Any]] = []
+
+    async def _run_tasks(self) -> None:
+        size = self.manifest.max_parallel
+        for offset in range(0, len(self.runtimes), size):
+            batch = self.runtimes[offset:offset + size]
+            try:
+                await asyncio.gather(*(self._run_task(runtime) for runtime in batch))
+            finally:
+                # Include completed attempts even when a signal cancels this batch.
+                keys = {runtime.task.key for runtime in batch}
+                rows, _ = read_model_log_rows(self.config.eval.jsonl_path)
+                rows = [row for row in rows if row.get("run_id") == self.run_id and row.get("task_key") in keys]
+                with self.ledger.open("a", encoding="utf-8") as fh:
+                    for row in rows:
+                        entry = self.plan[row["task_key"]]
+                        actual = audition_cost(row.get("cost_usd"))
+                        fh.write(json.dumps({
+                            "week": audition_week(), "run_id": self.run_id, "task_key": entry.key,
+                            "model": row["model"], "cost_usd": float(entry.estimate if actual is None else actual),
+                            "estimated": actual is None,
+                        }) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                self.audition_rows.extend(rows)
+            if any(row.get("failure_class") == "quota_exhausted" for row in rows):
+                print("audition run stopped on quota_exhausted")
+                for runtime in self.runtimes[offset + size:]:
+                    runtime.status = "fail"
+                    runtime.final_verdict = "SKIP"
+                    runtime.end_reason = "not started: quota_exhausted"
+                break
+            # Estimates are a planning bound; actual spend may differ. Recheck
+            # before launching the next batch, including an ISO-week rollover.
+            next_batch = self.runtimes[offset + size:offset + 2 * size]
+            estimate = sum((self.plan[r.task.key].estimate for r in next_batch), Decimal(0))
+            budget = Decimal(str(self.config.audition.weekly_budget_usd))
+            if next_batch and audition_spent(self.ledger, audition_week()) + estimate > budget:
+                print("audition run stopped on budget")
+                for runtime in self.runtimes[offset + size:]:
+                    runtime.status = "fail"
+                    runtime.final_verdict = "SKIP"
+                    runtime.end_reason = "not started: budget"
+                break
+
+
+def print_audition_summary(rows: list[dict[str, Any]], ledger: Path, budget: Decimal) -> None:
+    models = sorted({str(row.get("model")) for row in rows})
+    print(f"models tried ({len(models)}): {', '.join(models) or 'none'}")
+    for task_type in sorted({str(row.get("task_type")) for row in rows}):
+        counted = [row for row in rows if row.get("task_type") == task_type and is_model_counted(row)]
+        passed = sum(row.get("verdict") == "PASS" for row in counted)
+        print(f"{task_type}: PASS {passed} FAIL {len(counted) - passed}")
+    infra = model_infra_counts(rows)
+    print("infrastructure failures: " + (", ".join(f"{key}={value}" for key, value in sorted(infra.items())) or "none"))
+    spent = audition_spent(ledger, audition_week())
+    print(f"spent this week: ${spent:.6f} of ${budget:.6f}; budget left: ${max(Decimal(0), budget - spent):.6f}")
+
+
+def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
+    import fcntl
+
+    audition = config.audition
+    if audition.weekly_budget_usd is None:
+        raise ValueError("audition.weekly_budget_usd is required")
+    if audition.credential_file is None or not audition.credential_file.is_file():
+        raise ValueError("audition.credential_file is required and must exist")
+    max_models = args.max_models if args.max_models is not None else audition.max_models
+    if max_models <= 0:
+        raise ValueError("--max-models must be positive")
+    home = ringer_home()
+    home.mkdir(parents=True, exist_ok=True)
+    with (home / "audition.lock").open("a", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another audition run is active")
+            return 0
+        catalog = (args.catalog_file or default_catalog_path()).expanduser()
+        if not args.no_refresh:
+            try:
+                refresh_openrouter_catalog(catalog)
+            except Exception:
+                print("audition catalog refresh failed; falling back to the catalog snapshot")
+        models = load_catalog_snapshot(catalog)
+        rows, _ = read_model_log_rows(config.eval.jsonl_path)
+        ledger = home / "audition-spend.jsonl"
+        budget = Decimal(str(audition.weekly_budget_usd))
+        plan, skipped = plan_auditions(
+            load_audition_tasks(audition), models, rows, max_models=max_models,
+            budget=budget, spent=audition_spent(ledger, audition_week()),
+        )
+        for entry in plan:
+            print(f"PLAN {entry.key} openrouter/{entry.model} est=${entry.estimate:.6f}")
+        for entry in skipped:
+            print(f"SKIP {entry.key} budget")
+        print(f"total estimated: ${sum((entry.estimate for entry in plan), Decimal(0)):.6f}")
+        if not plan:
+            print("nothing to do")
+        if args.dry_run or not plan:
+            print_audition_summary([], ledger, budget)
+            return 0
+        credential = audition.credential_file.read_text(encoding="utf-8").strip()
+        if not credential:
+            raise ValueError("audition.credential_file must contain a non-empty key")
+        workdir = home / "auditions" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        manifest = audition_manifest(plan, audition, workdir)
+        if audition.engine not in config.engines:
+            raise ValueError(f"unknown audition.engine: {audition.engine}")
+        preflight_engine_bins(manifest, config)
+        # Auditions need the local, family-aware evidence journal even when
+        # ordinary work uses the legacy Postgres logger. Never retry an attempt.
+        config = dataclass_replace(config, eval=dataclass_replace(config.eval, backend="jsonl"),
+                                   retry=dataclass_replace(config.retry, infra_max=0))
+        identity = resolve_identity(None, config, [workdir])
+        for entry in plan:
+            shutil.copytree(entry.task.directory / "fixture", workdir / entry.key)
+        with audition_environment(audition, credential):
+            runner = AuditionRunner(manifest, config=config, identity=identity,
+                                    dashboard_enabled=False, plan=plan, ledger=ledger)
+            try:
+                return asyncio.run(run_manifest(manifest, config, identity, False, False, runner=runner))
+            finally:
+                print_audition_summary(runner.audition_rows, ledger, budget)
+
+
 async def run_manifest(
     manifest: Manifest,
     config: AppConfig,
     identity: str,
     dashboard_enabled: bool,
     force_browser: bool,
+    *,
+    runner: RingerRunner | None = None,
 ) -> int:
-    runner = RingerRunner(
+    runner = runner or RingerRunner(
         manifest,
         config=config,
         identity=identity,
@@ -12055,6 +12424,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the startup self-update check for this invocation",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    audition_parser = subparsers.add_parser("audition", help="run budgeted model auditions")
+    audition_parser.add_argument("--dry-run", action="store_true")
+    audition_parser.add_argument("--max-models", type=int)
+    audition_parser.add_argument("--catalog-file", type=Path)
+    audition_parser.add_argument("--no-refresh", action="store_true")
 
     update_parser = subparsers.add_parser(
         "self-update", help="check and apply an ff-only update from origin/main"
@@ -12341,6 +12716,8 @@ def main(argv: list[str] | None = None) -> int:
 
         config = AppConfig.load(args.config)
         print_engine_bin_diagnostics(config)
+        if args.command == "audition":
+            return run_audition_command(config, args)
         if args.command == "db":
             return run_db_command(config, args)
         if args.command == "models":

@@ -75,7 +75,11 @@ def cm(mid, prompt=0.5, completion=1.5, tools=True, ctx=128000, free=False, vari
 @unittest.skipUnless(LINUX_BWRAP, "audition checks run in the Linux check sandbox")
 class AuditionCommand(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        # Not under /tmp: the check sandbox mounts an empty /tmp, so an audition
+        # set living there would be invisible to its own checks.
+        base = Path.home() / ".cache" / "ringer-tests"
+        base.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=base)
         d = self.d = Path(self.tmp.name)
         self.home = d / "home"
         self.home.mkdir()

@@ -442,6 +442,93 @@ The promotion ladder is the point. A model enters as **untested**. You spend a s
 
 The per-user philosophy, stated plainly: every user's workload is different, so the scoreboard learns what works for *your* tasks on *your* machine. A model that's proven in someone else's log is untested in yours until you've run it. The numbers are not portable between users, and the routing recommendations get personal as the log grows — which is exactly why the catalog and the change log stay local and the explore tiers are computed from your own `runs.jsonl`, not from anyone's aggregate.
 
+## Auditions
+
+`ringer.py audition` runs the bundled repair, implementation, and review tasks
+against tool-capable OpenRouter text models. It favors models with no audition
+evidence, then those with fewer audition rows, then cheaper models. Each model
+gets every task whose task type has no prior audition row for that model.
+Recent provider-policy blocks are excluded. Auditions record the `audition`
+run family and **never set work tiers**.
+
+Give auditions a dedicated OpenRouter credential file and a weekly budget:
+
+```toml
+[audition]
+weekly_budget_usd = 5.0
+credential_file = "~/.config/ringer/audition.key"
+max_models = 5
+concurrency = 2
+engine = "opencode"
+token_estimate = 40000
+check_timeout_s = 120
+# set_dir = "/absolute/path/to/ringer/templates/audition"
+```
+
+Store only the key in `credential_file`, restrict its permissions (`chmod 600`),
+and use the sandboxed OpenCode engine. The default `set_dir` is the bundled
+`templates/audition` directory. Its fixtures are copied into fresh task
+workspaces, while the worker sandbox hides the set's checks and references.
+Checks run with the resolved Python interpreter through the offline Linux
+check sandbox (requires bwrap). `check_timeout_s` bounds each check; tasks get
+one attempt, including provider failures. Active auditions appear in Ringside.
+The command temporarily merges the credential into `OPENCODE_CONFIG_CONTENT`
+and appends the set directory to `RINGER_SANDBOX_HIDE`.
+
+```sh
+./ringer.py audition --dry-run
+./ringer.py audition --max-models 2
+# Use an existing snapshot without a catalog refresh:
+./ringer.py audition --dry-run --catalog-file ~/.ringer/openrouter-catalog.json --no-refresh
+```
+
+By default the command refreshes the catalog synchronously, falling back to the
+snapshot if refresh fails. Dry runs print `PLAN <task_key> <model> est=$<x>`,
+`SKIP <task_key> budget`, and total estimates without running workers or writing
+spend. The estimate uses the model's median earlier audition cost when available;
+otherwise it prices the task's `token_estimate` (falling back to the config) at
+85% input and 15% output tokens. Free models have zero estimated cost.
+
+The ledger is `$RINGER_HOME/audition-spend.jsonl` (`~/.ringer` by default), with
+weeks defined by local-time ISO weeks. Completed batches record actual costs,
+or their estimates if the provider reports no cost. Actual costs can exceed
+estimates; the runner checks the remaining budget between batches and stops
+starting batches after a quota-exhausted result. A nonblocking lock prevents
+overlapping auditions. Results are written to the configured local eval JSONL
+journal, including when ordinary runs use Postgres. The summary separates
+model verdicts from infrastructure failures and shows weekly spend and budget left.
+
+To schedule a Sunday run, create `~/.config/systemd/user/ringer-audition.service`
+with absolute paths to your Python 3.12+ interpreter, checkout, and config:
+
+```ini
+[Unit]
+Description=Weekly Ringer model auditions
+
+[Service]
+Type=oneshot
+Environment=RINGER_NO_SELF_UPDATE=1
+ExecStart=/absolute/path/to/python3 /absolute/path/to/ringer/ringer.py --config %h/.config/ringer/config.toml audition
+```
+
+Create `~/.config/systemd/user/ringer-audition.timer`:
+
+```ini
+[Unit]
+Description=Run Ringer auditions on Sunday
+
+[Timer]
+OnCalendar=Sun 03:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with `systemctl --user daemon-reload` and
+`systemctl --user enable --now ringer-audition.timer`. `Persistent=true` catches
+up a missed run when the user timer becomes active again.
+
 ## Steering profiles
 
 Ringer can optionally load per-model steering profiles, prepend applicable worker rules to both first-attempt and retry prompts, print driver guidance for the orchestrator, and collect one local observation row per attempt. The feature is fail-open: missing or malformed steering data never blocks a run. Setup, the profile contract, and the observation schema are documented in [`docs/STEERING.md`](docs/STEERING.md).

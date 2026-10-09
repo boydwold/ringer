@@ -110,7 +110,7 @@ class FailureClassificationTests(unittest.TestCase):
         outside = str(self.root / "outside.md")
         self.task = replace(self.task, expect_files=(outside,))
         self.assertEqual(self.classify(CAPACITY, missing=(outside,), error="spawn failed"), ("harness_error", "spawn failed"))
-        self.assertEqual(self.classify(CAPACITY + "\n[ringer-sandbox] failed", missing=(outside,))[0], "harness_error")
+        self.assertEqual(self.classify("[ringer-sandbox] failed\n" + CAPACITY, missing=(outside,))[0], "harness_error")
         self.assertEqual(self.classify(CAPACITY, missing=(outside,))[0], "sandbox_denied")
 
     def test_passing_verify_ignores_markers_but_not_worker_error(self):
@@ -263,3 +263,26 @@ class WrapperSandboxedEngineTests(unittest.TestCase):
             verify = ringer.VerifyResult(ok=False, check_returncode=1, check_timed_out=False, raw_output_excerpt="", missing_files=(outside,))
             cls, _ = ringer.classify_failure(worker, verify, task, engine, manifest, workdir / "t1")
             self.assertEqual(cls, "sandbox_denied")
+
+
+class SandboxMarkerPositionTests(unittest.TestCase):
+    """A [ringer-sandbox] line inside the engine's own output is tool output."""
+
+    def _case(self, output):
+        engine = ringer.load_engines({"codex": {"bin": "codex", "args_template": ["exec", "{spec}"]}})["codex"]
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "t1").mkdir()
+            task = ringer.TaskSpec(key="t1", spec="x" * 80, check="test -s notes.md", engine="codex", expect_files=("notes.md",))
+            manifest = ringer.Manifest(run_name="r", workdir=workdir, max_parallel=1, worktrees=False, repo=None, tasks=(task,))
+            worker = ringer.WorkerResult(returncode=0, timed_out=False, tokens=None, output_tail=output)
+            verify = ringer.VerifyResult(ok=False, check_returncode=1, check_timed_out=False, raw_output_excerpt="FAIL", missing_files=())
+            return ringer.classify_failure(worker, verify, task, engine, manifest, workdir / "t1")
+
+    def test_marker_after_engine_output_is_model(self):
+        out = "[ringer.py] attempt 1 started\nOpenAI Codex v0.x\nmodel: gpt-6-astra\n[ringer-sandbox] bwrap check sandbox setup failed\n"
+        self.assertEqual(self._case(out)[0], "model")
+
+    def test_marker_first_is_harness_error(self):
+        out = "[ringer.py] attempt 1 started\n[ringer-sandbox] bwrap not found\n"
+        self.assertEqual(self._case(out)[0], "harness_error")
