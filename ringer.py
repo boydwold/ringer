@@ -53,6 +53,19 @@ CONFIG_FILE_NAME = "config.toml"
 DEFAULT_ENGINE_NAME = "codex"
 DEFAULT_TIMEOUT_S = 900
 CHECK_TIMEOUT_S = 60
+FAILURE_CLASSES = frozenset({
+    "model", "rate_limited", "provider_error", "quota_exhausted",
+    "provider_policy", "sandbox_denied", "harness_error",
+})
+INFRA_TRANSIENT_CLASSES = frozenset({"rate_limited", "provider_error"})
+CODEX_FAILURE_RULES = (
+    ("rate_limited", re.compile(r"^ERROR: Selected model is at capacity")),
+    ("provider_error", re.compile(r"^ERROR: Reconnecting\.\.\. (\d+)/\1\s*$")),
+    ("quota_exhausted", re.compile(r"^ERROR: You.ve hit your usage limit")),
+    ("provider_policy", re.compile(r"^ERROR: This content was flagged for possible cybersecurity risk")),
+    ("harness_error", re.compile(r'^ERROR: \{.*"status":\s*400.*is not supported')),
+)
+CODEX_RECONNECT_RE = re.compile(r"^ERROR: Reconnecting\.\.\. \d+/\d+\s*$")
 # The run state file's format. Readers outside Ringer refuse a version they do
 # not know, so bump this whenever a field they read changes meaning or shape.
 STATE_VERSION = 1
@@ -748,6 +761,8 @@ class EngineConfig:
     # its own "model" — this is what makes a harness engine (OpenCode) model
     # agnostic instead of hard-coding one model into the command line.
     model_default: str = ""
+    failure_profile: str = "none"
+    failure_patterns: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def process_name(self) -> str:
@@ -1552,6 +1567,7 @@ def built_in_codex_engine() -> EngineConfig:
         sandbox_args=("--sandbox", "workspace-write"),
         token_regex=DEFAULT_TOKEN_REGEX,
         model_report_regex=DEFAULT_CODEX_MODEL_REPORT_REGEX,
+        failure_profile="codex",
     )
 
 
@@ -1725,6 +1741,27 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         model_default = str(
             section.get("model_default", base.model_default if base else "")
         ).strip()
+        failure_profile = section.get(
+            "failure_profile", clean_name if clean_name in {"codex", "opencode"} else "none"
+        )
+        if failure_profile not in ("codex", "opencode", "none"):
+            raise ValueError(f"engines.{clean_name}.failure_profile must be codex, opencode or none")
+        patterns_key = f"engines.{clean_name}.failure_patterns"
+        raw_patterns = section.get("failure_patterns", {})
+        if not isinstance(raw_patterns, dict):
+            raise ValueError(f"{patterns_key} must be a TOML table")
+        failure_patterns = []
+        for failure_class, patterns in raw_patterns.items():
+            if failure_class not in FAILURE_CLASSES:
+                raise ValueError(f"{patterns_key}: unknown failure class {failure_class!r}")
+            if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+                raise ValueError(f"{patterns_key}.{failure_class} must be a list of regex strings")
+            for pattern in patterns:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(f"{patterns_key}.{failure_class} is invalid: {exc}") from exc
+            failure_patterns.append((failure_class, tuple(patterns)))
         engines[clean_name] = EngineConfig(
             name=clean_name,
             bin=bin_path,
@@ -1734,6 +1771,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             token_regex=token_regex,
             model_report_regex=model_report_regex,
             model_default=model_default,
+            failure_profile=failure_profile,
+            failure_patterns=tuple(failure_patterns),
         )
     return engines
 
@@ -2354,6 +2393,7 @@ class WorkerResult:
     tokens: int | None
     error: str | None = None
     reported_model: str | None = None
+    output_tail: str = ""
 
 
 @dataclass(frozen=True)
@@ -2363,6 +2403,115 @@ class VerifyResult:
     check_timed_out: bool
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
+
+
+def opencode_failure_marker(event: Any) -> tuple[str | None, str]:
+    """Read only the error name, status and message, never transport metadata."""
+    if not isinstance(event, dict) or event.get("type") != "error":
+        return None, ""
+    error = event.get("error")
+    if not isinstance(error, dict) or not isinstance(error.get("name"), str):
+        return None, ""
+    name = error["name"]
+    data = error.get("data")
+    data = data if isinstance(data, dict) else {}
+    message = data.get("message", "")
+    message = message if isinstance(message, str) else ""
+    status = data.get("statusCode")
+    prefix = f"{name} {status}" if isinstance(status, (int, str)) else name
+    evidence = f"{prefix}: {message}" if message else prefix
+    failure_class = "provider_error"
+    if name == "APIError":
+        if status == 429:
+            failure_class = "rate_limited"
+        elif status == 402 or "credits" in message.lower():
+            failure_class = "quota_exhausted"
+        elif "matching your guardrail restrictions and data policy" in message.lower():
+            failure_class = "provider_policy"
+    return failure_class, evidence[:300]
+
+
+def classify_failure(
+    worker: WorkerResult,
+    verify: VerifyResult,
+    task: TaskSpec,
+    engine: EngineConfig,
+    manifest: Manifest,
+    taskdir: Path,
+) -> tuple[str | None, str]:
+    """Classify one failed attempt from its captured output and verification."""
+    if verify.ok and not worker.error:
+        return None, ""
+    if worker.error:
+        return "harness_error", worker.error[:300]
+    lines = worker.output_tail.splitlines()
+    for line in lines:
+        if line.startswith("[ringer-sandbox]"):
+            return "harness_error", line[:300]
+    if engine.sandbox_args and not task.full_access and not manifest.worktrees:
+        for path in verify.missing_files:
+            if (
+                (Path(path).is_absolute() or path.startswith("~"))
+                and expect_file_escapes_taskdir(path, manifest.workdir, task.key)
+                and not check_exports_path(task.check, path)
+                and not check_delegates_to_unreadable_script(task.check)
+            ):
+                return "sandbox_denied", (
+                    f"{path} is outside writable root {manifest.workdir / task.key}"
+                )[:300]
+
+    no_deliverables = bool(task.expect_files) and not any(
+        (taskdir / Path(path).expanduser()).exists() for path in task.expect_files
+    )
+    markers: list[tuple[int, str, str]] = []
+    last_engine_line = -1
+    reconnect_line = -1
+    reconnect_evidence = ""
+    for index, line in enumerate(lines):
+        if not line.strip() or line.startswith("[ringer"):
+            continue
+        event = None
+        if engine.failure_profile == "opencode":
+            try:
+                event = json.loads(line)
+            except ValueError:
+                pass
+            if isinstance(event, dict) and "type" in event:
+                last_engine_line = index
+            failure_class, evidence = opencode_failure_marker(event)
+            # Custom rules may match non-error events, but must not expose JSON.
+            evidence = evidence or "opencode marker"
+        else:
+            last_engine_line = index
+            failure_class, evidence = None, line.removeprefix("ERROR: ")
+        override = next((
+            name for name, patterns in engine.failure_patterns
+            if any(re.search(pattern, line) for pattern in patterns)
+        ), None)
+        if override is not None:
+            failure_class = override
+        elif engine.failure_profile == "codex":
+            failure_class = next((
+                name for name, pattern in CODEX_FAILURE_RULES if pattern.search(line)
+            ), None)
+            if failure_class is None and CODEX_RECONNECT_RE.search(line):
+                # Intermediate retries are diagnostics, never provider markers.
+                reconnect_line = index
+                reconnect_evidence = f"non-decisive marker: {evidence}"
+        if failure_class is not None:
+            markers.append((index, failure_class, evidence))
+
+    # Prefer the latest decisive marker when an attempt emits several errors.
+    for index, failure_class, evidence in reversed(markers):
+        if no_deliverables or index == last_engine_line:
+            return failure_class, evidence[:300]
+    if markers:
+        return "model", ("non-decisive marker: " + markers[-1][2])[:300]
+    if verify.check_timed_out:
+        return "model", "check timed out"
+    if reconnect_line >= 0 and reconnect_line < last_engine_line:
+        return "model", reconnect_evidence[:300]
+    return "model", ""
 
 
 class ProcessTree:
@@ -9477,6 +9626,7 @@ class RingerRunner:
             timed_out=timed_out,
             tokens=tokens,
             reported_model=reported_model,
+            output_tail=output_tail,
         )
 
     async def _tee_stream(
