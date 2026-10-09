@@ -118,7 +118,7 @@ class AuditionCommand(unittest.TestCase):
                  "full_access_args = []", 'failure_profile = "opencode"', 'token_aggregate = "sum"',
                  "token_regex = '\"tokens\":\\{\"total\":([0-9]+)'", "cost_regex = '\"cost\":([0-9.]+)'", "",
                  "[audition]", 'engine = "fake"', f'set_dir = "{self.set_dir}"', f"max_models = {max_models}",
-                 f"concurrency = {concurrency}"]
+                 f"concurrency = {concurrency}", 'usage_url = ""']
         if budget is not None:
             lines.append(f"weekly_budget_usd = {budget}")
         if cred:

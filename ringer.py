@@ -1121,6 +1121,7 @@ class AuditionConfig:
     # False skips ":free"/zero-price models, for accounts whose OpenRouter
     # privacy settings block free endpoints (they would all fail provider_policy).
     include_free: bool = True
+    usage_url: str = "https://openrouter.ai/api/v1/key"
 
 
 def load_audition_config(raw: Any) -> AuditionConfig:
@@ -1135,6 +1136,10 @@ def load_audition_config(raw: Any) -> AuditionConfig:
             raise ValueError("audition.weekly_budget_usd must be a finite number > 0")
         values["weekly_budget_usd"] = float(budget)
     defaults = AuditionConfig()
+    if "usage_url" in raw:
+        if not isinstance(raw["usage_url"], str):
+            raise ValueError("audition.usage_url must be a string")
+        values["usage_url"] = raw["usage_url"]
     for key in ("max_models", "token_estimate", "concurrency", "check_timeout_s"):
         value = raw.get(key, getattr(defaults, key))
         if type(value) is not int or value <= 0:
@@ -11892,34 +11897,67 @@ def audition_week() -> str:
     return f"{year}-W{week:02d}"
 
 
-def audition_cost(value: Any) -> Decimal | None:
+def audition_cost(value: Any, *, allow_negative: bool = False) -> Decimal | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
         cost = Decimal(str(value))
-        return cost if cost.is_finite() and cost >= 0 else None
+        return cost if cost.is_finite() and (allow_negative or cost >= 0) else None
     except InvalidOperation:
         return None
 
 
-def audition_spent(path: Path, week: str) -> Decimal:
+def read_audition_spend(path: Path) -> Iterable[tuple[dict[str, Any], Decimal]]:
     # Refuse a damaged ledger rather than silently understating money spent.
     if not path.exists():
-        return Decimal(0)
-    total = Decimal(0)
+        return
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             row = json.loads(line)
-            cost = audition_cost(row["cost_usd"])
+            cost = audition_cost(row["cost_usd"], allow_negative=row.get("kind") == "reconciliation")
             if cost is None or not isinstance(row["week"], str):
                 raise ValueError()
         except (ValueError, KeyError, TypeError):
             raise ValueError(f"invalid audition spend ledger: {path}") from None
-        if row["week"] == week:
-            total += cost
-    return total
+        yield row, cost
+
+
+def audition_spent(path: Path, week: str) -> Decimal:
+    return sum((cost for row, cost in read_audition_spend(path) if row["week"] == week), Decimal(0))
+
+
+def read_audition_usage(url: str, credential: str) -> Decimal | None:
+    """Read cumulative key usage; never expose provider errors or credentials."""
+    if not url:
+        return None
+    try:
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {credential}"})
+        # Keep usage authentication independent of any globally installed
+        # opener: its auth handlers may replace the dedicated audition key.
+        opener = urllib.request.build_opener()
+        with opener.open(request, timeout=15) as response:
+            usage = json.load(response)["data"]["usage"]
+        if type(usage) not in (int, float):
+            return None
+        return audition_cost(usage, allow_negative=True)
+    except Exception:
+        # Errors can contain request headers, URLs or response bodies. Do not
+        # print them, chain them into exceptions, or save them in the ledger.
+        return None
+
+
+def reconcile_audition_spend(ledger: Path, run_id: str, provider_delta: Decimal) -> None:
+    recorded = sum((cost for row, cost in read_audition_spend(ledger)
+                    if row.get("run_id") == run_id and row.get("kind") != "reconciliation"), Decimal(0))
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "week": audition_week(), "run_id": run_id, "kind": "reconciliation",
+            "cost_usd": float(provider_delta - recorded), "provider_delta": float(provider_delta),
+        }) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def plan_auditions(
@@ -12074,7 +12112,10 @@ class AuditionRunner(RingerRunner):
                 break
 
 
-def print_audition_summary(rows: list[dict[str, Any]], ledger: Path, budget: Decimal) -> None:
+def print_audition_summary(
+    rows: list[dict[str, Any]], ledger: Path, budget: Decimal, *,
+    provider_delta: Decimal | None = None, unreconciled_reason: str = "usage unavailable",
+) -> None:
     models = sorted({str(row.get("model")) for row in rows})
     print(f"models tried ({len(models)}): {', '.join(models) or 'none'}")
     for task_type in sorted({str(row.get("task_type")) for row in rows}):
@@ -12084,7 +12125,10 @@ def print_audition_summary(rows: list[dict[str, Any]], ledger: Path, budget: Dec
     infra = model_infra_counts(rows)
     print("infrastructure failures: " + (", ".join(f"{key}={value}" for key, value in sorted(infra.items())) or "none"))
     spent = audition_spent(ledger, audition_week())
-    print(f"spent this week: ${spent:.6f} of ${budget:.6f}; budget left: ${max(Decimal(0), budget - spent):.6f}")
+    status = f" (unreconciled): {unreconciled_reason}" if provider_delta is None else ""
+    print(f"spent this week: ${spent:.6f} of ${budget:.6f}; budget left: ${max(Decimal(0), budget - spent):.6f}{status}")
+    if provider_delta is not None:
+        print(f"provider-reported spend this run: ${provider_delta:.6f}")
 
 
 def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
@@ -12116,6 +12160,13 @@ def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
         rows, _ = read_model_log_rows(config.eval.jsonl_path)
         ledger = home / "audition-spend.jsonl"
         budget = Decimal(str(audition.weekly_budget_usd))
+        credential = ""
+        usage_before = None
+        if not args.dry_run:
+            credential = audition.credential_file.read_text(encoding="utf-8").strip()
+            if not credential:
+                raise ValueError("audition.credential_file must contain a non-empty key")
+            usage_before = read_audition_usage(audition.usage_url, credential)
         plan, skipped = plan_auditions(
             load_audition_tasks(audition), models, rows, max_models=max_models,
             budget=budget, spent=audition_spent(ledger, audition_week()),
@@ -12129,11 +12180,9 @@ def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
         if not plan:
             print("nothing to do")
         if args.dry_run or not plan:
-            print_audition_summary([], ledger, budget)
+            print_audition_summary([], ledger, budget,
+                                   unreconciled_reason="dry run" if args.dry_run else "nothing to do")
             return 0
-        credential = audition.credential_file.read_text(encoding="utf-8").strip()
-        if not credential:
-            raise ValueError("audition.credential_file must contain a non-empty key")
         workdir = home / "auditions" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         manifest = audition_manifest(plan, audition, workdir)
         if audition.engine not in config.engines:
@@ -12152,7 +12201,15 @@ def run_audition_command(config: AppConfig, args: argparse.Namespace) -> int:
             try:
                 return asyncio.run(run_manifest(manifest, config, identity, False, False, runner=runner))
             finally:
-                print_audition_summary(runner.audition_rows, ledger, budget)
+                usage_after = read_audition_usage(audition.usage_url, credential)
+                provider_delta = None
+                reason = "usage_url disabled" if not audition.usage_url else (
+                    "usage before run unavailable" if usage_before is None else "usage after run unavailable")
+                if usage_before is not None and usage_after is not None:
+                    provider_delta = usage_after - usage_before
+                    reconcile_audition_spend(ledger, runner.run_id, provider_delta)
+                print_audition_summary(runner.audition_rows, ledger, budget,
+                                       provider_delta=provider_delta, unreconciled_reason=reason)
 
 
 async def run_manifest(

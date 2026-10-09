@@ -459,6 +459,7 @@ Give auditions a dedicated OpenRouter credential file and a weekly budget:
 [audition]
 weekly_budget_usd = 5.0
 credential_file = "~/.config/ringer/audition.key"
+# usage_url = "https://openrouter.ai/api/v1/key" # "" disables reconciliation
 max_models = 5
 concurrency = 2
 engine = "opencode"
@@ -499,6 +500,18 @@ starting batches after a quota-exhausted result. A nonblocking lock prevents
 overlapping auditions. Results are written to the configured local eval JSONL
 journal, including when ordinary runs use Postgres. The summary separates
 model verdicts from infrastructure failures and shows weekly spend and budget left.
+
+Real runs read the audition key's cumulative usage from `usage_url` before
+planning and after the last batch. When both reads succeed, the ledger appends
+a reconciliation adjustment so the run's recorded total matches the provider's
+usage increase, including zero or negative adjustments. The summary prints
+`provider-reported spend this run`. The default endpoint is
+`https://openrouter.ai/api/v1/key`; set `usage_url = ""` to disable these reads.
+If either read fails or reconciliation is disabled, no adjustment is written
+and the spend summary says `(unreconciled)` with a reason; the run's exit status
+is unaffected. Use a dedicated key so unrelated usage is not counted as audition
+spend. The audition key's OpenRouter limit is the hard cap: the local weekly
+budget and batch estimates cannot prevent a running batch from overspending.
 
 To schedule a Sunday run, create `~/.config/systemd/user/ringer-audition.service`
 with absolute paths to your Python 3.12+ interpreter, checkout, and config:
