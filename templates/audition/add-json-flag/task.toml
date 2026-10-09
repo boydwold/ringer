@@ -1,0 +1,5 @@
+key = "add-json-flag"
+title = "Add JSON output to wordcount"
+task_type = "code-feature"
+expect_files = ['wordcount.py']
+token_estimate = 25000

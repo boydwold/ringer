@@ -1,0 +1,5 @@
+key = "fix-duration-parse"
+title = "Repair duration parsing"
+task_type = "code-fix"
+expect_files = ['duration.py']
+token_estimate = 25000

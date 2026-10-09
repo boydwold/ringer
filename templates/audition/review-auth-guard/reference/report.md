@@ -1,0 +1,3 @@
+- auth.py:6 Ordinary bytes equality may short-circuit based on the matching prefix of secret material; use a timing-safe comparison for password verifiers.
+- auth.py:10 The inclusive expiry comparison accepts a token at its expiration instant, although validity must end at that instant.
+- handler.py:7-8 The disable branch mutates settings without checking the admin role, so a member can disable the service and create an audit entry.

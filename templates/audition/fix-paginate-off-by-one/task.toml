@@ -1,0 +1,5 @@
+key = "fix-paginate-off-by-one"
+title = "Repair one-based pagination"
+task_type = "code-fix"
+expect_files = ['paginate.py']
+token_estimate = 20000
