@@ -64,8 +64,12 @@ class HudSingleTabTests(unittest.TestCase):
             original_alive = ringer.hud_is_alive
             original_open = ringer.open_in_browser
             original_popen = ringer.subprocess.Popen
+            original_viewer = ringer.hud_has_recent_viewer
             try:
                 ringer.hud_is_alive = lambda _port: next(alive_results)
+                # Without this the test reads the real Ringside heartbeat on
+                # port 8700 and fails whenever someone has the page open.
+                ringer.hud_has_recent_viewer = lambda _port: False
                 ringer.open_in_browser = opened.append
 
                 def fake_popen(*args: object, **_kwargs: object) -> object:
@@ -78,6 +82,7 @@ class HudSingleTabTests(unittest.TestCase):
                 ringer.hud_is_alive = original_alive
                 ringer.open_in_browser = original_open
                 ringer.subprocess.Popen = original_popen
+                ringer.hud_has_recent_viewer = original_viewer
             self.assertEqual(1, len(spawned))
             self.assertEqual(["http://127.0.0.1:8700"], opened)
 
