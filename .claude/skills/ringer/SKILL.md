@@ -281,9 +281,15 @@ experiment. Never explore on time-critical work, never with more than a
 small slice of a batch, and name the experiment when presenting the engine
 ask so the human can veto it. Promotion ladder (computed by --explore):
 untested → probation (some evidence) → proven for a task_type (3+ tasks,
-first-try ≥ 0.67). Proven models earn bigger lanes in that type and an
-audition one rung up in adjacent types; repeated first-attempt failures end
-the audition — record the demotion in MODEL-NOTES so the next orchestrator
+first-try ≥ 0.67). Tiers come from model evidence on work runs only: PASS or
+`failure_class` `model` (missing class in legacy rows also qualifies).
+Infrastructure failures — `rate_limited`, `provider_error`, `quota_exhausted`,
+`provider_policy`, `sandbox_denied`, `harness_error` — never count. Audition
+results (run family `"audition"`, `./ringer.py models --family audition`)
+guide which untested models to try first but never set a tier. Proven models
+earn bigger lanes in that type and a trial one rung up in adjacent types;
+repeated first-attempt model failures end the trial — record the demotion in
+MODEL-NOTES with an evidence citation (step 5 below) so the next orchestrator
 doesn't re-run the experiment.
 
 **OpenCode is the harness; the model is a manifest field.** Unless a model
@@ -412,11 +418,17 @@ describes what happened.
 4. Failures with useless error messages mean your CHECK needs work, not
    (only) the worker.
 5. **Update `docs/MODEL-NOTES.md`** (in the ringer repo) when a run taught
-   you something about a model: one dated line under the model — task type,
-   what happened (attempts, tokens, failure mode), what you'd do
-   differently. Only what the executed checks and raw logs support. The raw
-   numbers took care of themselves — every attempt already landed in the
-   local model log (`./ringer.py models` to see the updated scoreboard).
+   you something about a model: one dated bullet under its heading — task
+   type, what happened, what you'd do differently. This fork's evidence bar:
+   cite an executed-check attempt with
+   `[evidence: run=<run_id> task=<task_key> model=<slug> attempt=<n> verdict=<PASS|FAIL|TIMEOUT> type=<task_type> family=<work|audition>]`.
+   Only model evidence: PASS or `failure_class` `model` (legacy missing class
+   qualifies); never `rate_limited`, `provider_error`, `quota_exhausted`,
+   `provider_policy`, `sandbox_denied`, or `harness_error` failures. The
+   heading must name the cited model (slug, registry display name, or identity
+   key). Before committing, run
+   `./ringer.py notes check --base upstream/main --log ~/.ringer/runs.jsonl`.
+   Only what executed checks and raw logs support — no worker self-reports.
 
 ## Spend your own context deliberately
 

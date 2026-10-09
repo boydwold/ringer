@@ -7866,6 +7866,141 @@ def normalize_notes_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
+MODEL_NOTES_EVIDENCE_RE = re.compile(
+    r"\[evidence:\s+run=(?P<run_id>[^\s\[\]]+)"
+    r"\s+task=(?P<task_key>[^\s\[\]]+)"
+    r"\s+model=(?P<model>[^\s\[\]]+)"
+    r"\s+attempt=(?P<attempt>[1-9][0-9]*)"
+    r"\s+verdict=(?P<verdict>PASS|FAIL|TIMEOUT)"
+    r"\s+type=(?P<task_type>[^\s\[\]]+)"
+    r"\s+family=(?P<family>work|audition)\]"
+)
+
+
+def parse_model_notes_entries(text: str) -> list[tuple[str, list[str]]]:
+    """Parse dated bullet blocks, preserving separate, duplicate headings."""
+    sections: list[tuple[str, list[str]]] = []
+    bullets: list[str] | None = None
+    active: list[str] = []
+
+    def flush_bullet() -> None:
+        if active and bullets is not None:
+            entry = "\n".join(active).strip()
+            if re.search(r"\b\d{4}-\d{2}-\d{2}\b", entry):
+                bullets.append(entry)
+        active.clear()
+
+    for line in text.splitlines():
+        if line.startswith("## "):
+            flush_bullet()
+            bullets = []
+            sections.append((line[3:].strip(), bullets))
+        elif bullets is not None and line.startswith("- "):
+            flush_bullet()
+            active.append(line[2:].strip())
+        elif active and (line.startswith(("  ", "\t")) or not line.strip()):
+            active.append(line.strip())
+        else:
+            flush_bullet()
+    flush_bullet()
+    return sections
+
+
+def model_notes_heading_matches(
+    heading: str, model: str, registry: ModelIdentityRegistry
+) -> bool:
+    candidates = {model, model.removeprefix("openrouter/")}
+    # A citation has no engine field. Look up explicit routes for this slug;
+    # engine defaults must not turn an unknown slug into a known identity.
+    for engine, key in registry.identities.keys() | registry.noncanonical_routes.keys():
+        if key.removeprefix("openrouter/") != model.removeprefix("openrouter/"):
+            continue
+        identity = registry.resolve(engine, key)
+        candidates.update((identity.model_display, identity.canonical_model_key or key))
+    return any(model_judgment_notes(candidate, {heading: ["match"]}) for candidate in candidates)
+
+
+def model_notes_citation_errors(
+    citation: re.Match[str], rows: list[dict[str, Any]]
+) -> list[str]:
+    matches = [
+        row for row in rows
+        if row.get("run_id") == citation["run_id"]
+        and row.get("task_key") == citation["task_key"]
+        and row.get("model") == citation["model"]
+        and str(row.get("model_attempt")) == citation["attempt"]
+    ]
+    if not matches:
+        return ["run not found"]
+    errors: list[str] = []
+    for row in matches:
+        row_errors = []
+        if row.get("verdict") != citation["verdict"]:
+            row_errors.append("verdict mismatch")
+        if row.get("run_family", "work") != citation["family"]:
+            row_errors.append("family mismatch")
+        if row.get("verdict") != "PASS" and row.get("failure_class") not in (None, "model"):
+            row_errors.append("not model evidence")
+        if not row_errors:
+            return []
+        errors.extend(row_errors)
+    return list(dict.fromkeys(errors))
+
+
+def run_notes_check_command(args: argparse.Namespace) -> int:
+    notes_path = args.notes_file.expanduser().resolve()
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments], cwd=notes_path.parent,
+            capture_output=True, text=True, check=False,
+        )
+
+    try:
+        root = git("rev-parse", "--show-toplevel")
+    except OSError as exc:
+        print(f"notes check: git checkout unavailable: {exc}", file=sys.stderr)
+        return 2
+    if root.returncode:
+        print("notes check: notes file is not inside a git checkout", file=sys.stderr)
+        return 2
+    base = git("rev-parse", "--verify", "--end-of-options", f"{args.base}^{{commit}}")
+    if base.returncode:
+        print(f"notes check: ref not found: {args.base}", file=sys.stderr)
+        return 2
+    relative_path = notes_path.relative_to(Path(root.stdout.strip())).as_posix()
+    previous = git("show", f"{base.stdout.strip()}:{relative_path}")
+    old_entries: dict[str, set[str]] = {}
+    for heading, entries in parse_model_notes_entries(previous.stdout if previous.returncode == 0 else ""):
+        old_entries.setdefault(heading, set()).update(" ".join(entry.split()) for entry in entries)
+    rows = read_model_log_rows(args.log.expanduser())[0] if args.log is not None else None
+    registry = load_model_identity_registry()
+    checked = failed = 0
+    for heading, entries in parse_model_notes_entries(notes_path.read_text(encoding="utf-8")):
+        for entry in entries:
+            normalized = " ".join(entry.split())
+            if normalized in old_entries.get(heading, set()):
+                continue
+            checked += 1
+            citations = list(MODEL_NOTES_EVIDENCE_RE.finditer(entry))
+            reasons = []
+            if not citations:
+                reasons.append("missing evidence")
+            elif "[evidence:" in MODEL_NOTES_EVIDENCE_RE.sub("", entry):
+                reasons.append("missing evidence fields (invalid citation)")
+            for citation in citations:
+                if not model_notes_heading_matches(heading, citation["model"], registry):
+                    reasons.append(f"model {citation['model']} does not match heading")
+                if rows is not None:
+                    reasons.extend(model_notes_citation_errors(citation, rows))
+            if reasons:
+                failed += 1
+                preview = normalized[:80] + ("…" if len(normalized) > 80 else "")
+                print(f"{preview}: {'; '.join(dict.fromkeys(reasons))}")
+    print(f"{checked} entries checked")
+    return 1 if failed else 0
+
+
 def parse_model_notes_sections(path: Path) -> dict[str, list[str]]:
     """Return dated bullet blocks keyed by the raw level-2 heading text."""
     try:
@@ -7977,7 +8112,8 @@ def enrich_model_groups_with_notes(
 
 
 def strip_inline_markdown(value: str) -> str:
-    text = re.sub(r"`([^`]*)`", r"\1", value)
+    text = re.sub(r"\[evidence:[^\]]*\]", "", value)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -11777,6 +11913,13 @@ def build_parser() -> argparse.ArgumentParser:
     models_parser.add_argument("--open", action="store_true", help="render the HTML scoreboard to the artifact library and open it")
     models_parser.add_argument("--json", action="store_true", help="print the scoreboard as JSON")
 
+    notes_parser = subparsers.add_parser("notes", help="validate model judgment notes")
+    notes_subparsers = notes_parser.add_subparsers(dest="notes_command", required=True)
+    notes_check_parser = notes_subparsers.add_parser("check", help="check evidence for new or edited dated entries")
+    notes_check_parser.add_argument("--base", required=True, help="git ref to compare notes against")
+    notes_check_parser.add_argument("--log", type=Path, help="verify citations against this eval JSONL log")
+    notes_check_parser.add_argument("--notes-file", type=Path, default=default_model_notes_path(), help="path to MODEL-NOTES.md")
+
     catalog_parser = subparsers.add_parser("catalog", help="show or refresh the local OpenRouter model catalog")
     catalog_parser.add_argument("--refresh", action="store_true", help="fetch source and rewrite the local snapshot")
     catalog_parser.add_argument("--source", help=f"OpenRouter models URL or fixture file (default: {DEFAULT_CATALOG_SOURCE})")
@@ -11867,6 +12010,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "catalog":
             return run_catalog_command(args)
+        if args.command == "notes":
+            return run_notes_check_command(args)
 
         config = AppConfig.load(args.config)
         print_engine_bin_diagnostics(config)
