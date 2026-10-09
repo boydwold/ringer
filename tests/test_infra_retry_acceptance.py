@@ -102,9 +102,12 @@ class InfraRetryTests(unittest.TestCase):
     def rows(self):
         return [json.loads(l) for l in self.jsonl.read_text().splitlines() if l.strip()] if self.jsonl.exists() else []
 
-    def state_task(self, key):
+    def state(self):
         states = sorted((self.state_dir / "runs").glob("*.json"), key=lambda p: p.stat().st_mtime)
-        data = json.loads(states[-1].read_text())
+        return json.loads(states[-1].read_text())
+
+    def state_task(self, key):
+        data = self.state()
         tasks = data["tasks"]
         return tasks[key] if isinstance(tasks, dict) else next(t for t in tasks if t.get("key") == key)
 
@@ -125,6 +128,7 @@ class InfraRetryTests(unittest.TestCase):
         self.assertFalse(rows[1]["retry"], "an infra retry is not a re-prompt")
         self.assertEqual({x["run_family"] for x in rows}, {"work"})
         st = self.state_task("t")
+        self.assertEqual(self.state()["state_version"], 2, "new status values and attempts semantics need state_version 2")
         self.assertEqual(st["model_attempts"], 1)
         self.assertEqual(st["infra_retries"], 1)
         line = ringer.plain_transition_event("t", "running", "pass", st)["line"]

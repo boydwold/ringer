@@ -128,8 +128,8 @@ class StateTests(unittest.TestCase):
         )
 
     def test_state_version(self) -> None:
-        self.assertEqual(STATE_VERSION, 1)
-        self.assertEqual(self._writer(None, None).snapshot()["state_version"], 1)
+        self.assertEqual(STATE_VERSION, 2)
+        self.assertEqual(self._writer(None, None).snapshot()["state_version"], 2)
 
     def test_meta_in_state(self) -> None:
         state = self._writer(OPENSPEC_TASK, OPENSPEC_RUN).snapshot()
@@ -145,7 +145,7 @@ class StateTests(unittest.TestCase):
         writer = self._writer(OPENSPEC_TASK, OPENSPEC_RUN)
         writer.flush()
         data = json.loads(writer.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["state_version"], 1)
+        self.assertEqual(data["state_version"], 2)
         self.assertEqual(data["meta"]["openspec"]["change"], "add-sso-login")
         self.assertEqual(data["tasks"][0]["meta"]["openspec"]["task"], "2.1")
 
