@@ -45,11 +45,13 @@ class UsageStub:
     def __init__(self, values):
         self.values = list(values)
         self.auth_headers = []
+        self.paths = []
         stub = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 stub.auth_headers.append(self.headers.get("Authorization", ""))
+                stub.paths.append(self.path)
                 usage = stub.values.pop(0) if stub.values else stub.values_last
                 body = json.dumps({"data": {"usage": usage, "limit": 25}}).encode()
                 self.send_response(200)
@@ -129,7 +131,11 @@ class Reconcile(unittest.TestCase):
         finally:
             stub.close()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue(all(h == "Bearer sk-or-AUDITION-TEST-KEY" for h in stub.auth_headers), "uses the audition key")
+        # Only requests to the key endpoint are ours. Unauthenticated GET / probes
+        # from elsewhere on the host sometimes reach this random local port.
+        ours = [h for h, path in zip(stub.auth_headers, stub.paths) if path == "/api/v1/key"]
+        self.assertEqual(len(ours), 2, f"usage read before and after; saw {stub.paths}")
+        self.assertTrue(all(h == "Bearer sk-or-AUDITION-TEST-KEY" for h in ours), "uses the audition key")
         led = self.ledger()
         rec = [x for x in led if x.get("kind") == "reconciliation"]
         self.assertEqual(len(rec), 1, led)
