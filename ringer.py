@@ -764,6 +764,8 @@ class EngineConfig:
     model_default: str = ""
     failure_profile: str = "none"
     failure_patterns: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    token_aggregate: str = "last"
+    cost_regex: str | None = None
 
     @property
     def process_name(self) -> str:
@@ -1751,6 +1753,19 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
                 re.compile(token_regex, flags=re.IGNORECASE)
             except re.error as exc:
                 raise ValueError(f"engines.{clean_name}.token_regex is invalid: {exc}") from exc
+        token_aggregate = section.get("token_aggregate", base.token_aggregate if base else "last")
+        if token_aggregate not in ("last", "sum"):
+            raise ValueError(f"engines.{clean_name}.token_aggregate must be last or sum")
+        cost_regex = section.get("cost_regex", base.cost_regex if base else None)
+        if cost_regex is not None:
+            if not isinstance(cost_regex, str):
+                raise ValueError(f"engines.{clean_name}.cost_regex must be a string")
+            try:
+                compiled_cost = re.compile(cost_regex, flags=re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"engines.{clean_name}.cost_regex is invalid: {exc}") from exc
+            if compiled_cost.groups < 1:
+                raise ValueError(f"engines.{clean_name}.cost_regex must have a capture group")
         model_report_regex = optional_string(section.get("model_report_regex"))
         if model_report_regex is None and base is not None:
             model_report_regex = base.model_report_regex
@@ -1796,6 +1811,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             full_access_args=full_access_args,
             sandbox_args=sandbox_args,
             token_regex=token_regex,
+            token_aggregate=token_aggregate,
+            cost_regex=cost_regex,
             model_report_regex=model_report_regex,
             model_default=model_default,
             failure_profile=failure_profile,
@@ -2423,6 +2440,7 @@ class WorkerResult:
     error: str | None = None
     reported_model: str | None = None
     output_tail: str = ""
+    cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -10233,6 +10251,7 @@ class RingerRunner:
             log_fh = log_path.open("ab")
         except OSError as exc:
             return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+        output_start = log_fh.tell()
         async with AsyncFileCloser(log_fh):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -10270,8 +10289,21 @@ class RingerRunner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader
             self.active_processes.pop(proc.pid, None)
+            output_end = log_fh.tell()
         output_tail = capture.text()
-        tokens = parse_token_count(output_tail, engine.token_regex)
+        accounting_output = output_tail
+        if engine.token_aggregate == "sum" or engine.cost_regex is not None:
+            # Exclude prior attempts and command/spec headers. The rolling tail
+            # can discard early steps, so read this invocation's output in full.
+            with log_path.open("rb") as output_fh:
+                output_fh.seek(output_start)
+                accounting_output = output_fh.read(output_end - output_start).decode("utf-8", errors="replace")
+        tokens = parse_token_count(
+            accounting_output if engine.token_aggregate == "sum" else output_tail,
+            engine.token_regex,
+            aggregate=engine.token_aggregate,
+        )
+        cost_usd = parse_cost(accounting_output, engine.cost_regex)
         reported_model = parse_reported_model(output_tail, engine.model_report_regex)
         if timed_out:
             append_text(log_path, f"\n[ringer.py] worker timed out after {runtime.task.timeout_s}s\n")
@@ -10282,6 +10314,7 @@ class RingerRunner:
             tokens=tokens,
             reported_model=reported_model,
             output_tail=output_tail,
+            cost_usd=cost_usd,
         )
 
     async def _tee_stream(
@@ -10390,6 +10423,7 @@ class RingerRunner:
                 "verdict": verdict,
                 "duration_ms": duration_ms,
                 "worker_tokens": worker.tokens,
+                "cost_usd": worker.cost_usd,
                 "notes": "\n".join(notes_parts),
                 "orchestrator": self.identity,
                 "model": stamped_model,
@@ -10602,16 +10636,22 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def parse_token_count(text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX) -> int | None:
+def parse_token_count(
+    text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX, aggregate: str = "last"
+) -> int | None:
     if token_regex:
         matches = list(re.finditer(token_regex, text, flags=re.IGNORECASE))
+        counts = []
         for match in reversed(matches):
             groups = [item for item in match.groups() if item]
             value = groups[0] if groups else match.group(0)
             number = re.search(r"([0-9][0-9,]*)", value)
             if number:
-                return int(number.group(1).replace(",", ""))
-        return None
+                count = int(number.group(1).replace(",", ""))
+                if aggregate == "last":
+                    return count
+                counts.append(count)
+        return sum(counts) if counts else None
     matches = re.findall(r"tokens\s+used\s*:?\s*([0-9][0-9,]*)", text, flags=re.IGNORECASE)
     if not matches:
         matches = re.findall(
@@ -10621,7 +10661,22 @@ def parse_token_count(text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX) 
         )
     if not matches:
         return None
+    if aggregate == "sum":
+        return sum(int(value.replace(",", "")) for value in matches)
     return int(matches[-1].replace(",", ""))
+
+
+def parse_cost(text: str, cost_regex: str | None) -> float | None:
+    if cost_regex is None:
+        return None
+    total = None
+    for match in re.finditer(cost_regex, text, flags=re.IGNORECASE):
+        try:
+            value = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        total = value if total is None else total + value
+    return total
 
 
 def parse_reported_model(text: str, model_report_regex: str | None) -> str | None:

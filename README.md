@@ -367,6 +367,8 @@ The scoreboard keeps the trained model, its lab, the invoking harness, the acces
 
 Every task attempt is logged **automatically and locally** to `~/.ringer/runs.jsonl` — no setup, no account, nothing leaves your machine. Each row carries the per-attempt verdict straight from the EXECUTED check, plus duration, tokens, the resolved `model`, the task's `task_type` (if the manifest set one), and the `retry` number.
 
+Attempt rows include `cost_usd`, summed from the first capture group of every engine `cost_regex` match, or `null` when cost is unknown. For engines that report tokens per step, such as OpenCode, set `token_aggregate = "sum"` to add every token match within the attempt; the default `"last"` preserves the last reported token count.
+
 Read it with:
 
 ```bash

@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WRAP = ROOT / "engines" / "opencode-sandboxed.sh"
 CHECKW = ROOT / "engines" / "check-sandboxed.sh"
 
+# Real interpreter path: a mise/pyenv shim on PATH can stall inside the
+# read-only sandbox (it tries to write its own state), which made these probes flaky.
+PY = os.path.realpath(sys.executable)
 LINUX_BWRAP = sys.platform.startswith("linux") and shutil.which("bwrap") is not None
 
 STUB = """#!/bin/sh
@@ -42,7 +45,7 @@ def tcp_server() -> tuple[int, threading.Thread]:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
     srv.listen(4)
-    srv.settimeout(10)
+    srv.settimeout(60)
 
     def serve():
         try:
@@ -126,7 +129,7 @@ class OpencodeWrapperLinuxTests(unittest.TestCase):
         if not bus.exists():
             self.skipTest("no user session bus on this host")
         probe = (
-            "python3 -c \"import socket,sys\n"
+            f"{PY} -c \"import socket,sys\n"
             "s=socket.socket(socket.AF_UNIX)\n"
             "try:\n s.connect('" + str(bus) + "'); print('BUS-REACHED')\n"
             "except OSError as e: print('bus-blocked', e)\""
@@ -155,7 +158,7 @@ class OpencodeWrapperLinuxTests(unittest.TestCase):
     def test_local_tcp_and_dns(self):
         port, t = tcp_server()
         probe = (
-            "python3 -c \"import socket\n"
+            f"{PY} -c \"import socket\n"
             f"s=socket.create_connection(('127.0.0.1',{port}),5); print(s.recv(16).decode().strip())\n"
             "print('dns', bool(socket.getaddrinfo('localhost', 80)))\""
         )

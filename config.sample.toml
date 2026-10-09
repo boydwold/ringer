@@ -193,7 +193,10 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # ]
 # sandbox_args = []
 # full_access_args = ["--no-sandbox"]
-# token_regex = '"tokens":\{"total":([0-9]+)'
+# token_regex = '"type":"step_finish".*?"tokens":\{"total":([0-9]+)'
+# Sum tokens and USD cost across all model steps in each attempt.
+# token_aggregate = "sum"
+# cost_regex = '"type":"step_finish".*?"cost":([0-9.eE+-]+)'
 
 [artifact]
 # Zero-LLM, self-contained HTML artifacts rendered directly from state — no model calls, no
