@@ -244,3 +244,22 @@ class WorkerCaptureTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WrapperSandboxedEngineTests(unittest.TestCase):
+    """An engine whose wrapper sandboxes by default (empty sandbox_args, a
+    full_access switch) still yields sandbox_denied for an escaping path."""
+
+    def test_opencode_wrapper_engine_is_sandboxed(self):
+        engine = ringer.load_engines({"opencode": {"bin": "x", "args_template": ["{taskdir}", "{access_args}", "{spec}"],
+                                            "sandbox_args": [], "full_access_args": ["--no-sandbox"]}})["opencode"]
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "t1").mkdir()
+            outside = "/tmp/ringer-wrapper-not-here/report.md"
+            task = ringer.TaskSpec(key="t1", spec="x" * 80, check="test -s report.md", engine="opencode", expect_files=(outside,))
+            manifest = ringer.Manifest(run_name="r", workdir=workdir, max_parallel=1, worktrees=False, repo=None, tasks=(task,))
+            worker = ringer.WorkerResult(returncode=1, timed_out=False, tokens=None, output_tail="")
+            verify = ringer.VerifyResult(ok=False, check_returncode=1, check_timed_out=False, raw_output_excerpt="", missing_files=(outside,))
+            cls, _ = ringer.classify_failure(worker, verify, task, engine, manifest, workdir / "t1")
+            self.assertEqual(cls, "sandbox_denied")

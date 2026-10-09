@@ -2477,7 +2477,10 @@ def classify_failure(
     for line in lines:
         if line.startswith("[ringer-sandbox]"):
             return "harness_error", line[:300]
-    if engine.sandbox_args and not task.full_access and not manifest.worktrees:
+    # Sandboxed: explicit sandbox args (codex), or a wrapper that sandboxes by
+    # default and has a full-access switch to turn it off (opencode wrapper).
+    sandboxed = bool(engine.sandbox_args) or bool(engine.full_access_args)
+    if sandboxed and not task.full_access and not manifest.worktrees:
         for path in verify.missing_files:
             if (
                 (Path(path).is_absolute() or path.startswith("~"))
