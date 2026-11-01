@@ -32,6 +32,12 @@ EXCLUDED_AUTHORS = {
     # DOES owe credit for merged work — never send this line in a PR.
     "boyd wold",
 }
+# FORK-ONLY: single upstream commits pushed straight to upstream main, not
+# community PRs, whose authors upstream itself does not credit. Listed by SHA so
+# later work by the same author is still audited.
+EXCLUDED_COMMITS = {
+    "5b9a8ec86e75db287e6e5182c260ade310570ca8",  # license notice legal name
+}
 EXCLUDED_AUTHOR_PREFIXES = ("claude", "cursor")
 EXCLUDED_HANDLES = {
     "justfinethanku",
@@ -74,8 +80,11 @@ class ContributorCreditTests(unittest.TestCase):
 
         missing: list[str] = []
 
-        for line in git_lines("log", "--format=%an"):
-            name = line.strip()
+        for line in git_lines("log", "--format=%H%x00%an"):
+            sha, _, name = line.partition("\0")
+            if sha in EXCLUDED_COMMITS:
+                continue
+            name = name.strip()
             lowered = name.lower()
             if lowered in EXCLUDED_AUTHORS:
                 continue
