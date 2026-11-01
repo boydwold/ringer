@@ -10,6 +10,10 @@ from pathlib import Path
 MAX_WORDS = 1200
 REQUIRED_HEADINGS = ("Summary", "Findings", "Clean", "Assumptions")
 FINDING_FIELDS = ("Evidence:", "Impact:", "Fix:", "Priority:", "Confidence:")
+# The value may be wrapped in markdown emphasis (**P1**, _P1_, `P1`) but must sit
+# on the same line as its label, so a later bullet cannot supply it.
+PRIORITY_RE = re.compile(r"Priority:[ \t*_`]*P[0-3](?![0-9A-Za-z])", re.IGNORECASE)
+CONFIDENCE_RE = re.compile(r"Confidence:[ \t*_`]*(high|medium|low)(?![A-Za-z])", re.IGNORECASE)
 OPEN_PLACEHOLDER = "{" * 2
 CLOSE_PLACEHOLDER = "}" * 2
 
@@ -67,9 +71,9 @@ def validate_report(path: Path, surface: str) -> list[str]:
                     failures.append(fail("finding_missing_field", f"finding {index} is missing {field}"))
             if "Evidence:" in block and not re.search(r"\b[\w./-]+:\d+\b", block):
                 failures.append(fail("finding_missing_line", f"finding {index} evidence should cite file:line"))
-            if not re.search(r"Priority:\s*P[0-3]\b", block, re.IGNORECASE):
+            if not PRIORITY_RE.search(block):
                 failures.append(fail("finding_bad_priority", f"finding {index} priority must be P0, P1, P2, or P3"))
-            if not re.search(r"Confidence:\s*(high|medium|low)\b", block, re.IGNORECASE):
+            if not CONFIDENCE_RE.search(block):
                 failures.append(fail("finding_bad_confidence", f"finding {index} confidence must be high, medium, or low"))
     elif "no findings" not in findings.lower():
         failures.append(fail("findings_not_explicit", "Findings must contain at least one '### Finding:' block or say 'No findings'"))

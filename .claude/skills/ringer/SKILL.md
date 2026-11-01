@@ -146,7 +146,9 @@ self-contained:
   human-readable brief. Never write a pointer spec ("read /path/to/file and
   do what it says"): the watcher sees no brief, and the retry prompt loses
   the context it needs. Point at files for source MATERIAL; the instructions
-  themselves live in the spec. Lint flags pointer specs.
+  themselves live in the spec. Lint flags pointer specs. **A rules file is
+  an instruction, not material:** "read AGENTS.md" is a pointer spec too —
+  paste the rules the worker can break, verbatim, with their source.
 
 ## Check-writing rules
 
@@ -159,6 +161,7 @@ the check's failure output.
 - **Verify content, not existence.** Grep the artifact for required sections,
   run the code it produced, run the build, run the validator — execute
   something that would catch a lazy or hallucinated result.
+- **In a shared uncommitted tree, ownership is checked by hashing NAMED files, never by `git status`/`git diff --name-only HEAD`.** A whole-tree diff flags the orchestrator's scratch and a sibling lane's mid-edit files as "outside ownership", and a worker told that deletes them — INT-813 (2026-08-29) lost `PLAN.json`, `.feature-loop/`, then a sibling's finished tests, three times in one job. Snapshot the files that must not move before the run; the check compares those hashes and says nothing about any other path.
 - **`expect_files` is a floor, not the check.** List deliverables there for
   fast triage, but the check must still validate them.
 - **Verify a grep hit or a green check by reading what the code does, before it becomes a claim.** Ask two questions every time: *could this check have failed?* and *am I looking where the answer actually lives?* Nine wrong conclusions in one session (2026-07-30) all came from skipping them — `429` matched inside a timestamp; `stall` inside `install`; a `sleep(10)` that was text inside a string literal written out to a fake worker; a filename that only appeared in my own comment; `/api/v1/models`, which answers a **fake** key, used to "prove" a credential valid; `zsh -lic` inheriting the very variable it was testing for; a test asserting on stdout when the verdict lives in the run record. Each check was seconds. Two produced recommendations that were wrong on the merits.
@@ -211,6 +214,7 @@ the check's failure output.
   own validator" test so the checker exercises what it preaches. And keep
   orchestrator patch review mandatory regardless of PASS status — a green
   check is not proof of semantic correctness.
+- **Every worker check on a feature-loop build starts with `loop-gate preflight --tests <paths> &&`** — format, lint, type, and test-collection failures then cost the worker one attempt instead of a Ringer retry.
 
 ## Pattern playbook
 
@@ -255,20 +259,10 @@ Pattern-selection judgment:
 
 ## Engine selection
 
-**The engine choice belongs to the human — but the recommendation comes
-from THEIR evidence.** Before the FIRST run of a job: read what's wired up
-(`[engines.<name>]` blocks in `~/.config/ringer/config.toml`), run
-`./ringer.py models --task-type <this job's type>` for the local scoreboard,
-and glance at `./ringer.py catalog --changes` for anything newly free or
-newly cheap. Then ask the user which model should do the typing — top 2–3
-options with the NUMBERS in the pitch and a recommendation, e.g.: *"GLM is
-6/6 first-try on persona work here at ~2¢/task — recommended. Codex is also
-100% but ~8x the tokens. And kimi went free on OpenRouter yesterday — want
-it auditioning one of the small tasks?"* Honor their pick via the per-task
-`engine`/`model` fields; don't re-ask every round of the same job unless
-the mix isn't working. This is per-user by design: the scoreboard learns
-THIS user's workload — never import another machine's conclusions or
-recommend from a different user's numbers.
+Pick the engine from `./ringer.py models --task-type <type>` yourself and
+say which you picked and why in one line; Boyd delegated this choice
+(memory `ringer-claude-owns-model-choice`). Explore per the next
+paragraph.
 
 **Explore or the scoreboard fossilizes.** Always recommending the proven
 pick means never learning a new one. In any run of 3+ tasks that has a
