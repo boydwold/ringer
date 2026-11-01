@@ -10728,7 +10728,11 @@ def parse_token_count(
                 if aggregate == "last":
                     return count
                 counts.append(count)
-        return sum(counts) if counts else None
+        if counts:
+            return sum(counts)
+        if is_opencode_json_token_regex(token_regex):
+            return parse_opencode_step_tokens(text, aggregate)
+        return None
     matches = re.findall(r"tokens\s+used\s*:?\s*([0-9][0-9,]*)", text, flags=re.IGNORECASE)
     if not matches:
         matches = re.findall(
@@ -10741,6 +10745,59 @@ def parse_token_count(
     if aggregate == "sum":
         return sum(int(value.replace(",", "")) for value in matches)
     return int(matches[-1].replace(",", ""))
+
+
+OPENCODE_TOKEN_PARTS = ("input", "output", "reasoning")
+
+
+def is_opencode_json_token_regex(token_regex: str) -> bool:
+    """True when an engine's token_regex reads OpenCode JSON events.
+
+    Only those engines get the step_finish fallback, so a codex, claude or
+    mock worker that happens to print a step_finish line is not counted.
+    """
+    return "step_finish" in token_regex or '"tokens"' in token_regex
+
+
+def parse_opencode_step_tokens(text: str, aggregate: str = "last") -> int | None:
+    """Token count from OpenCode JSON step_finish events that carry no total.
+
+    OpenCode 1.x sent "tokens":{"total":N,...}; 2.x sends only the parts. The
+    1.x total was input + output + reasoning + cache.read + cache.write, so
+    each step is counted the same way. A step whose parts are not all
+    non-negative ints is skipped, as are lines that are not such events.
+    Used only when an OpenCode-style token_regex matches nothing.
+    """
+    counts: list[int] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"step_finish"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "step_finish":
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != "step-finish":
+            continue
+        tokens = part.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        cache = tokens.get("cache", {})
+        if not isinstance(cache, dict):
+            continue
+        values = [tokens.get(key) for key in OPENCODE_TOKEN_PARTS]
+        values += [cache.get("read"), cache.get("write")]
+        present = [v for v in values if v is not None]
+        # Every reported part must be a non-negative int (bool is an int subclass).
+        if not present or any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in present):
+            continue
+        counts.append(sum(present))
+    if not counts:
+        return None
+    return sum(counts) if aggregate == "sum" else counts[-1]
 
 
 def parse_cost(text: str, cost_regex: str | None) -> float | None:
