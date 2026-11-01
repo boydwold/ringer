@@ -212,6 +212,52 @@ run_linux() {
     chmod 600 "$SCRATCH/data/opencode/auth.json"
   fi
 
+  # OpenCode 2.2.5 also keeps provider keys in opencode.db, which stays hidden
+  # here, so a --standalone worker found no provider (provider.no-route, klipsch,
+  # 2026-11-01). Write each "type": "api" key from auth.json into a private
+  # config file in the scratch dir (provider.<id>.options.apiKey, mode 600) and
+  # point OPENCODE_CONFIG at it. Only the path goes into the environment, so the
+  # tools the worker runs never inherit a key, and nothing here prints one.
+  # OpenCode gives a <PROVIDER>_API_KEY variable and OPENCODE_CONFIG_CONTENT
+  # priority over this file, so a key the caller set still wins. A caller's own
+  # OPENCODE_CONFIG is kept as it is.
+  if [ -f "$OC_SHARE/auth.json" ]; then
+    if [ -n "${OPENCODE_CONFIG:-}" ]; then
+      echo "[ringer-sandbox] OPENCODE_CONFIG is set; not adding provider keys from auth.json" >&2
+    else
+      local keys_file="$SCRATCH/ringer-provider-keys.json"
+      local keys_status=0
+      python3 -I -c '
+import json, os, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(3)
+if not isinstance(data, dict):
+    sys.exit(3)
+providers = {}
+for provider, entry in data.items():
+    if not isinstance(provider, str) or not provider or not isinstance(entry, dict):
+        continue
+    key = entry.get("key")
+    if entry.get("type") == "api" and isinstance(key, str) and key:
+        providers[provider] = {"options": {"apiKey": key}}
+if not providers:
+    sys.exit(3)
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="ascii") as f:
+    json.dump({"provider": providers}, f)
+' "$OC_SHARE/auth.json" "$keys_file" >/dev/null 2>&1 || keys_status=$?
+      case "$keys_status" in
+        0) export OPENCODE_CONFIG="$keys_file" ;;
+        3) ;;
+        *) rm -f -- "$keys_file"
+           echo "[ringer-sandbox] could not pass provider keys from auth.json (python3 exit $keys_status); an OpenCode 2.2.5+ worker may fail with provider.no-route" >&2 ;;
+      esac
+    fi
+  fi
+
   local runtime_dir="/run/user/$(id -u)"
   local home_real
   home_real="$(cd "$HOME" && pwd -P)"
