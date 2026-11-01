@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WRAP = ROOT / "engines" / "opencode-sandboxed.sh"
 LINUX_BWRAP = sys.platform.startswith("linux") and shutil.which("bwrap") is not None
-STUB = '#!/bin/sh\nexec sh -c "$STUB_SCRIPT"\n'
+STUB = '#!/bin/sh\nif [ "$1" = "--version" ]; then exit 0; fi\nexec sh -c "$STUB_SCRIPT"\n'
 
 
 @unittest.skipUnless(LINUX_BWRAP, "Linux with bwrap only")

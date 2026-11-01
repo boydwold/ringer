@@ -37,6 +37,8 @@ LINUX_BWRAP = sys.platform.startswith("linux") and shutil.which("bwrap") is not 
 
 STUB = """#!/bin/sh
 # Stand-in for opencode: run the script passed in STUB_SCRIPT.
+# The wrapper asks for the version outside the sandbox; answer and stop.
+if [ "$1" = "--version" ]; then exit 0; fi
 exec sh -c "$STUB_SCRIPT"
 """
 

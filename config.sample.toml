@@ -179,13 +179,17 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # OpenRouter key where your OpenCode version expects it — commonly
 # ~/.local/share/opencode/auth.json ({"openrouter": {"type": "api", "key": "..."}});
 # confirm the path with your installed CLI.
-# Per-task engine_args can set reasoning effort ("--variant", "low|high|max").
+# Per-task engine_args can set reasoning effort ("--variant", "low|high|max")
+# on OpenCode 1.x; 2.x has no --variant, so put it in the model instead
+# ("provider/model#high"). Ringer runs the worker in the task dir, so no
+# --dir flag is needed (2.x rejects it; the wrapper drops a --dir {taskdir}).
 # Uncomment and set an absolute path for `bin` to enable.
 # Linux example: this same block works with bwrap and unprivileged namespaces.
 # Export OPENCODE_BIN=/absolute/path/to/opencode to pin the real executable.
 # For OpenCode 1.18.x, replace --dangerously-skip-permissions below with --auto
-# for headless permission approval; add --pure to skip user plugins, e.g.:
-# args_template = ["{taskdir}", "{access_args}", "run", "--pure", "--auto", "-m", "{model}", "--format", "json", "{engine_args}", "--dir", "{taskdir}", "{spec}"]
+# for headless permission approval; add --pure to skip user plugins (1.18.x
+# only; 2.x rejects --pure), e.g.:
+# args_template = ["{taskdir}", "{access_args}", "run", "--pure", "--auto", "-m", "{model}", "--format", "json", "{engine_args}", "{spec}"]
 # [engines.opencode]
 # bin = "/absolute/path/to/ringer/engines/opencode-sandboxed.sh"
 # model_default = "openrouter/z-ai/glm-5.2"
@@ -199,8 +203,6 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 #   "--format",
 #   "json",
 #   "{engine_args}",
-#   "--dir",
-#   "{taskdir}",
 #   "{spec}",
 # ]
 # sandbox_args = []
