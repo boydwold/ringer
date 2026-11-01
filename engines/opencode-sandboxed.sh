@@ -21,6 +21,35 @@ TASKDIR="${1:?usage: opencode-sandboxed.sh <taskdir> [--no-sandbox] <args...>}";
 SANDBOX=1
 if [ "${1:-}" = "--no-sandbox" ]; then SANDBOX=0; shift; fi
 
+# OpenCode 2.x removed `run --dir` and rejects it ("Unrecognized flag: --dir").
+# Ringer starts the worker in the task dir already, so a `--dir` naming the
+# task dir is redundant on every version: drop it. Any other `--dir` value
+# passes through unchanged, and OpenCode reports it. The last argument is the
+# prompt (`{spec}`), so it is never read as a flag or removed.
+same_dir() {
+  [ -d "$1" ] && [ -d "$2" ] && [ "$(cd "$1" && pwd -P)" = "$(cd "$2" && pwd -P)" ]
+}
+args_in=("$@")
+n_args=${#args_in[@]}
+filtered=()
+i=0
+while [ "$i" -lt "$n_args" ]; do
+  arg="${args_in[$i]}"
+  if [ "$i" -lt $((n_args - 1)) ]; then
+    if [ "$arg" = "--dir" ] && [ "$i" -lt $((n_args - 2)) ] &&
+       same_dir "${args_in[$((i + 1))]}" "$TASKDIR"; then
+      i=$((i + 2))
+      continue
+    fi
+    case "$arg" in
+      --dir=*) if same_dir "${arg#--dir=}" "$TASKDIR"; then i=$((i + 1)); continue; fi ;;
+    esac
+  fi
+  filtered+=("$arg")
+  i=$((i + 1))
+done
+set -- ${filtered[@]+"${filtered[@]}"}
+
 # Resolve opencode without tripping `set -e` (command -v returns nonzero when absent).
 if [ -z "${OPENCODE_BIN:-}" ] || [ ! -f "$OPENCODE_BIN" ] || [ ! -x "$OPENCODE_BIN" ]; then
   if ! OPENCODE_BIN="$(command -v opencode)" || [ ! -f "$OPENCODE_BIN" ] || [ ! -x "$OPENCODE_BIN" ]; then
@@ -31,6 +60,53 @@ fi
 
 if [ "$SANDBOX" = "0" ]; then
   exec "$OPENCODE_BIN" "$@" < /dev/null
+fi
+
+# OpenCode 2.x runs through a shared background service and records it in
+# ~/.config/opencode/service.json, which stays read-only in the sandbox (EPERM).
+# `--standalone` gives this worker a private server instead; 1.x lacks the flag.
+# RINGER_OPENCODE_STANDALONE=1 or 0 forces the choice. Otherwise the wrapper
+# asks `opencode --version` (outside the sandbox, at most 10 s) for the major
+# version. The last argument is the prompt and is not checked for the flag.
+opencode_major() {
+  local out pid tries=0 line
+  out="$(mktemp "${TMPDIR:-/tmp}/ringer-oc-version.XXXXXX")"
+  "$OPENCODE_BIN" --version > "$out" 2> /dev/null < /dev/null &
+  pid=$!
+  while kill -0 "$pid" 2> /dev/null && [ "$tries" -lt 50 ]; do
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  if kill -0 "$pid" 2> /dev/null; then
+    kill "$pid" 2> /dev/null || true
+    echo "[ringer-sandbox] opencode --version did not answer in 10 s; not adding --standalone" >&2
+  fi
+  wait "$pid" 2> /dev/null || true
+  line="$(head -n 1 "$out")"
+  rm -f "$out"
+  if [[ "$line" =~ ([0-9]+)\.[0-9]+ ]]; then echo "${BASH_REMATCH[1]}"; fi
+}
+if [ "${1:-}" = "run" ]; then
+  add_standalone=0
+  case "${RINGER_OPENCODE_STANDALONE:-auto}" in
+    1) add_standalone=1 ;;
+    0) ;;
+    *)
+      major="$(opencode_major)"
+      if [ -n "$major" ] && [ "$major" -ge 2 ]; then add_standalone=1; fi
+      ;;
+  esac
+  if [ "$add_standalone" = "1" ]; then
+    j=1
+    while [ "$j" -lt "$#" ]; do
+      if [ "${!j}" = "--standalone" ]; then add_standalone=0; fi
+      j=$((j + 1))
+    done
+  fi
+  if [ "$add_standalone" = "1" ]; then
+    shift
+    set -- run --standalone "$@"
+  fi
 fi
 
 run_darwin() {
