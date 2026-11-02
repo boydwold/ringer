@@ -192,6 +192,30 @@ set -e
 exit "$status"
 }
 
+# A run killed with SIGKILL skips its EXIT trap, so its scratch dir, with the
+# auth.json copy and the provider keys file, stays on disk. Remove such dirs
+# from earlier runs in the same parent dir. Each run holds a flock on its own
+# scratch dir (the directory itself, which the worker cannot replace), so a
+# dir is removed only when no live run holds that lock; the removal runs under
+# it. Only real dirs that this user owns and that are named like ours are
+# touched. A dir with the .ringer-lock marker was locked by its owner, so a
+# free lock means a dead run. A dir without the marker may belong to a wrapper
+# that never locks (an older version, or no flock), so it is removed only
+# after a day. A dir that cannot be removed never stops this run. The lock is
+# taken on "$dir/.", so if a worker swaps the name for a symlink in between,
+# the open fails instead of creating the symlink's target.
+sweep_dead_scratch() {
+  local parent="$1" own="$2" dir
+  while IFS= read -r -d '' dir; do
+    [ "$dir" = "$own" ] && continue
+    if [ ! -e "$dir/.ringer-lock" ] && [ ! -L "$dir/.ringer-lock" ]; then
+      [ -n "$(find "$dir" -maxdepth 0 -mmin +1440 2> /dev/null)" ] || continue
+    fi
+    flock -n "$dir/." rm -rf -- "$dir" > /dev/null 2>&1 || true
+  done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
+             -name 'ringer-opencode.??????' -print0 2> /dev/null || true)
+}
+
 run_linux() {
   local BWRAP="${RINGER_SANDBOX_BWRAP:-bwrap}"
   if ! BWRAP="$(command -v "$BWRAP")" || [ ! -f "$BWRAP" ] || [ ! -x "$BWRAP" ]; then
@@ -206,6 +230,23 @@ run_linux() {
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ringer-opencode.XXXXXX")"
   trap 'rm -rf -- "$SCRATCH"' EXIT
   SCRATCH="$(cd "$SCRATCH" && pwd -P)"
+  # Hold a flock on this scratch dir for the whole run. Both bwrap calls
+  # close the descriptor, so the worker cannot hold or release the lock, and
+  # bwrap dies with this script (--die-with-parent). The lock is on the
+  # directory itself: the worker can write inside it but cannot replace it.
+  # The marker file is written only after the lock is held, and only says
+  # that this run locks; the sweep never opens it. The lock never waits: if
+  # another process already holds it, this run goes on like a run without
+  # flock (no marker, no sweep). The sweep is skipped when the scratch parent
+  # is inside the task dir, because the worker can rename entries there.
+  exec {SCRATCH_LOCK_FD}< "$SCRATCH"
+  if command -v flock > /dev/null 2>&1 && flock -n -x "$SCRATCH_LOCK_FD"; then
+    : > "$SCRATCH/.ringer-lock"
+    case "${SCRATCH%/*}/" in
+      "$TASKDIR_REAL"/*) ;;
+      *) sweep_dead_scratch "${SCRATCH%/*}" "$SCRATCH" ;;
+    esac
+  fi
   mkdir -p -- "$SCRATCH/cache" "$SCRATCH/data/opencode" "$SCRATCH/state/opencode"
   if [ -f "$OC_SHARE/auth.json" ]; then
     cp -- "$OC_SHARE/auth.json" "$SCRATCH/data/opencode/auth.json"
@@ -338,12 +379,12 @@ with os.fdopen(fd, "w", encoding="ascii") as f:
 
   # Exercise all mounts/namespaces before starting the worker. A setup error
   # must never fall back to running it directly or masquerade as its exit code.
-  if ! "$BWRAP" "${args[@]}" /usr/bin/true < /dev/null; then
+  if ! "$BWRAP" "${args[@]}" /usr/bin/true < /dev/null {SCRATCH_LOCK_FD}>&-; then
     echo "[ringer-sandbox] bwrap sandbox setup failed (check mounts and namespace support)" >&2
     exit 1
   fi
   local status=0
-  "$BWRAP" "${args[@]}" "$OPENCODE_BIN" "$@" < /dev/null || status=$?
+  "$BWRAP" "${args[@]}" "$OPENCODE_BIN" "$@" < /dev/null {SCRATCH_LOCK_FD}>&- || status=$?
   exit "$status"
 }
 
