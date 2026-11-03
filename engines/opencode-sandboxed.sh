@@ -62,8 +62,9 @@ if [ "$SANDBOX" = "0" ]; then
   exec "$OPENCODE_BIN" "$@" < /dev/null
 fi
 
-# OpenCode 2.x runs through a shared background service and records it in
-# ~/.config/opencode/service.json, which stays read-only in the sandbox (EPERM).
+# OpenCode 2.x runs through a shared background service by default. The
+# sandbox hides that service's record and password from the worker (see the
+# service note in each platform's setup; macOS has known gaps).
 # `--standalone` gives this worker a private server instead; 1.x lacks the flag.
 # RINGER_OPENCODE_STANDALONE=1 or 0 forces the choice. Otherwise the wrapper
 # asks `opencode --version` (outside the sandbox, at most 10 s) for the major
@@ -123,6 +124,17 @@ if [ "${RINGER_OPENCODE_PROJECT_CONFIG:-0}" != "1" ]; then
   unset OPENCODE_CONFIG_PROJECT_DISABLE
   export OPENCODE_DISABLE_PROJECT_CONFIG=1
 fi
+# OpenCode reads the shared service's password from OPENCODE_PASSWORD, then
+# OPENCODE_SERVER_PASSWORD. The worker runs `run --standalone` and needs
+# neither, so a caller's value must not reach it (see the service note below).
+unset OPENCODE_PASSWORD OPENCODE_SERVER_PASSWORD
+# A relative OPENCODE_CONFIG_DIR means one dir to the caller and another to
+# this wrapper, so the wrapper would hide the wrong service file. Refuse it.
+unset CDPATH
+case "${OPENCODE_CONFIG_DIR:-/}" in
+  /*) ;;
+  *) echo "[ringer-sandbox] OPENCODE_CONFIG_DIR must be an absolute path" >&2; exit 1 ;;
+esac
 
 run_darwin() {
 if [ ! -x /usr/bin/sandbox-exec ]; then
@@ -177,6 +189,23 @@ cat > "$PROFILE" <<'SBEOF'
   (global-name "com.apple.lsd.modifydb")
   (global-name "com.apple.lsd.openurl")
   (global-name "com.apple.xpc.launchd"))
+; OpenCode 2.x runs a shared background service outside this sandbox, on
+; 127.0.0.1 (port 49374 by default). Its record in
+; ~/.local/state/opencode/service.json holds the password, and
+; ~/.config/opencode/service.json holds one after `opencode service set
+; password` (versioned builds use service-*.json). With the password, a worker
+; could ask that service to run commands with no sandbox at all. The worker
+; runs `run --standalone`, which needs none of these files. Deny reading and
+; writing them, wherever they are. The pattern is fixed text, so no path
+; enters the profile. Not yet tested on a Mac. Known gaps (refute pass,
+; 2026-11-02): the temp file the service writes before it renames it, the
+; service.json.pty-handoff ticket, the PTY daemon's token in
+; ~/.local/state/opencode/pty/<id>/service.json, and a service.json in an
+; OPENCODE_CONFIG_DIR whose name is not "opencode". Seatbelt checks the
+; resolved path, so a service.json that is a symlink to a file with another
+; name is not denied either.
+(deny file-read* file-write*
+  (regex #"/opencode/service[^/]*\.json$"))
 SBEOF
 
 # Only generated integer names enter profile text; paths remain -D parameters.
@@ -370,8 +399,37 @@ with os.fdopen(fd, "w", encoding="ascii") as f:
   done
   # Hide shared credentials/history without creating directories in the real home.
   # Restore writable task/scratch mounts afterwards, even if nested under a mask.
-  if [ -d "$OC_SHARE" ]; then args+=(--tmpfs "$OC_SHARE"); fi
-  if [ -d "$OC_STATE" ]; then args+=(--tmpfs "$OC_STATE"); fi
+  # Mount on the resolved path: bwrap cannot mount on a symlink. A state dir
+  # inside the task or scratch dir would come back with their binds below,
+  # so refuse it.
+  hide_dir() {
+    local real
+    real="$(cd -P -- "$1" && pwd -P)" || exit 1
+    case "$real/" in
+      "$TASKDIR_REAL"/*|"$SCRATCH"/*)
+        echo "[ringer-sandbox] $1 is inside the task or scratch dir; refusing to run" >&2
+        exit 1 ;;
+    esac
+    args+=(--tmpfs "$real")
+  }
+  if [ -d "$OC_SHARE" ]; then hide_dir "$OC_SHARE"; fi
+  local oc_state_real=""
+  if [ -d "$OC_STATE" ]; then
+    oc_state_real="$(cd -P -- "$OC_STATE" && pwd -P)"
+    hide_dir "$OC_STATE"
+  fi
+  # A custom XDG_STATE_HOME holds the shared service's record (with its
+  # password), the PTY daemon's token and the temp file of each restart.
+  # Hide the whole dir, as for the default one: the service replaces its
+  # record by rename, and a rename removes a mount over a single file.
+  local oc_state_xdg="${XDG_STATE_HOME:-$HOME/.local/state}/opencode"
+  local oc_state_xdg_real
+  if [ -d "$oc_state_xdg" ]; then
+    oc_state_xdg_real="$(cd -P -- "$oc_state_xdg" && pwd -P)" || exit 1
+    if [ "$oc_state_xdg_real" != "$oc_state_real" ]; then
+      hide_dir "$oc_state_xdg"
+    fi
+  fi
   args+=(--bind "$TASKDIR_REAL" "$TASKDIR_REAL" --bind "$SCRATCH" "$SCRATCH")
   # The provider keys file is an OpenCode config file (OPENCODE_CONFIG), and
   # OpenCode watches it for changes. It sits in the writable scratch dir, so
@@ -379,6 +437,29 @@ with os.fdopen(fd, "w", encoding="ascii") as f:
   if [ -f "$SCRATCH/ringer-provider-keys.json" ]; then
     args+=(--ro-bind "$SCRATCH/ringer-provider-keys.json" "$SCRATCH/ringer-provider-keys.json")
   fi
+  # OpenCode 2.x runs a shared background service outside this sandbox, on
+  # 127.0.0.1 (port 49374 by default), and the sandbox shares the host
+  # network. The service's record in <state>/opencode/service.json holds
+  # its password; both state dirs are hidden above. The config file
+  # <config>/opencode/service.json holds one after `opencode service set
+  # password` (versioned builds use service-*.json). With it, a worker could
+  # ask that service to run commands with no sandbox at all. The worker runs
+  # `run --standalone` and needs none of these files, so /dev/null is mounted
+  # over each config file that exists (over its target, if it is a symlink).
+  # bwrap mounts it nodev, so a read fails with "Permission denied". Known
+  # gap: a config file created or replaced during the run is not covered.
+  local svc_dir svc_file svc_seen=$'\n'
+  # OPENCODE_CONFIG_DIR, when set, replaces the config dir, so it is covered too.
+  for svc_dir in ${OPENCODE_CONFIG_DIR:+"$OPENCODE_CONFIG_DIR"} \
+                 "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" "$HOME/.config/opencode"; do
+    for svc_file in "$svc_dir"/service.json "$svc_dir"/service-*.json; do
+      [ -f "$svc_file" ] || continue
+      svc_file="$(readlink -f -- "$svc_file")"
+      case "$svc_seen" in *$'\n'"$svc_file"$'\n'*) continue ;; esac
+      svc_seen+="$svc_file"$'\n'
+      args+=(--ro-bind /dev/null "$svc_file")
+    done
+  done
   local hidden
   for hidden in "${HIDDEN_PATHS[@]}"; do
     if [ -d "$hidden" ]; then
