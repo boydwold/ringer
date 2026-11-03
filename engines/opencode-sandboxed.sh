@@ -189,6 +189,27 @@ cat > "$PROFILE" <<'SBEOF'
   (global-name "com.apple.lsd.modifydb")
   (global-name "com.apple.lsd.openurl")
   (global-name "com.apple.xpc.launchd"))
+; The Keychain. On macOS the CodeRabbit CLI keeps its sign-in tokens in the
+; login Keychain (service "@coderabbitai/cli"), not in ~/.coderabbit, and the
+; sandbox shares the network. The CLI saved the item, so the same CLI inside
+; the sandbox could read it with no prompt and run a review in Boyd's name
+; (Boyd's decision, 2026-11-03: workers must not use it). Deny the Keychain
+; services, so a process inside the sandbox cannot read Keychain items through
+; the Security framework (both the file keychain and the data protection
+; keychain). Tested on a Mac in the desktop session on 2026-11-03: without this
+; rule a sandboxed process could see the CodeRabbit item and read a test
+; keychain's secret; with it, it could not. A real opencode worker run, HTTPS
+; to the model provider and public git over HTTPS still worked.
+; Side effect: other sign-ins in the Keychain are also unusable inside the
+; sandbox, for example the gh CLI's token and git's osxkeychain credential
+; helper. Workers must not push or open pull requests, so this is intended.
+; Known gap (refute pass, 2026-11-03): the sandbox shares the network, so with
+; Remote Login on, a worker can ssh to this Mac and run a process outside the
+; sandbox, where none of these rules apply.
+(deny mach-lookup
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.securityd"))
 ; OpenCode 2.x runs a shared background service outside this sandbox, on
 ; 127.0.0.1 (port 49374 by default). Its record in
 ; ~/.local/state/opencode/service.json holds the password, and
@@ -197,7 +218,8 @@ cat > "$PROFILE" <<'SBEOF'
 ; could ask that service to run commands with no sandbox at all. The worker
 ; runs `run --standalone`, which needs none of these files. Deny reading and
 ; writing them, wherever they are. The pattern is fixed text, so no path
-; enters the profile. Not yet tested on a Mac. Known gaps (refute pass,
+; enters the profile. Tested on a Mac on 2026-11-03: the file reads as
+; "Operation not permitted". Known gaps (refute pass,
 ; 2026-11-02): the temp file the service writes before it renames it, the
 ; service.json.pty-handoff ticket, the PTY daemon's token in
 ; ~/.local/state/opencode/pty/<id>/service.json, and a service.json in an
@@ -525,8 +547,8 @@ done
 # - files in the folder that are symlinks stay readable at their target;
 # - Linux: the keyring is out of reach only because the session bus socket is
 #   not reachable; a bus on an abstract socket would be reachable;
-# - macOS: the CLI keeps the sign-in in the Keychain, which this profile does
-#   not block. Not tested on a Mac.
+# - macOS: the CLI keeps the sign-in in the Keychain, not in this folder. The
+#   Seatbelt profile denies the Keychain services (see run_darwin).
 coderabbit_dir="$HOME/.coderabbit"
 # Workers that start at once may race to create it; the loser finds it made.
 if [ ! -e "$coderabbit_dir" ] && [ ! -L "$coderabbit_dir" ]; then

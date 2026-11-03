@@ -55,5 +55,7 @@ The rule is text in the spec, not a sandbox. Two limits apply. Codex's `workspac
 sandbox probably blocks the CLI's network access, so an allowed review may need
 `full_access`. On Linux the opencode sandbox always hides `~/.coderabbit` (Boyd's decision,
 2026-11-03), so a sandboxed opencode worker cannot use the machine's CodeRabbit
-sign-in. On macOS the CLI keeps the sign-in in the Keychain, which the sandbox does
-not block (not tested on a Mac). A Codex worker has no such guard.
+sign-in. On macOS the CLI keeps the sign-in in the login Keychain, and the sandbox
+denies the Keychain services, so a process inside the sandbox cannot read it
+(tested on a Mac on 2026-11-03). A Codex worker has no
+such guard.
