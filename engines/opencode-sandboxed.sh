@@ -109,6 +109,21 @@ if [ "${1:-}" = "run" ]; then
   fi
 fi
 
+# OpenCode reads project config (opencode.json, opencode.jsonc and the
+# .opencode folder, with its agents and plugins) from the task dir and from
+# every dir above it, up to the git root. The worker can write the task dir, so it could write its own
+# permission rules there, and in worktrees mode the repo could ship them.
+# Turn project config off for the sandboxed worker. This also skips the
+# project's AGENTS.md files. OpenCode 2.2.5 reads OPENCODE_CONFIG_PROJECT_DISABLE
+# and falls back to OPENCODE_DISABLE_PROJECT_CONFIG. With both names set,
+# even both to 1, it read project config again (`opencode debug config
+# --standalone`, klipsch, 2026-11-02), so exactly one name is set here.
+# RINGER_OPENCODE_PROJECT_CONFIG=1 keeps project config on, for a repo you trust.
+if [ "${RINGER_OPENCODE_PROJECT_CONFIG:-0}" != "1" ]; then
+  unset OPENCODE_CONFIG_PROJECT_DISABLE
+  export OPENCODE_DISABLE_PROJECT_CONFIG=1
+fi
+
 run_darwin() {
 if [ ! -x /usr/bin/sandbox-exec ]; then
   echo "opencode-sandboxed.sh: /usr/bin/sandbox-exec not available (macOS only)." >&2
@@ -358,6 +373,12 @@ with os.fdopen(fd, "w", encoding="ascii") as f:
   if [ -d "$OC_SHARE" ]; then args+=(--tmpfs "$OC_SHARE"); fi
   if [ -d "$OC_STATE" ]; then args+=(--tmpfs "$OC_STATE"); fi
   args+=(--bind "$TASKDIR_REAL" "$TASKDIR_REAL" --bind "$SCRATCH" "$SCRATCH")
+  # The provider keys file is an OpenCode config file (OPENCODE_CONFIG), and
+  # OpenCode watches it for changes. It sits in the writable scratch dir, so
+  # mount it read-only: a worker must not add permission rules to it.
+  if [ -f "$SCRATCH/ringer-provider-keys.json" ]; then
+    args+=(--ro-bind "$SCRATCH/ringer-provider-keys.json" "$SCRATCH/ringer-provider-keys.json")
+  fi
   local hidden
   for hidden in "${HIDDEN_PATHS[@]}"; do
     if [ -d "$hidden" ]; then
