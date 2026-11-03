@@ -53,5 +53,7 @@ the signed-in session of the machine it runs on.
 
 The rule is text in the spec, not a sandbox. Two limits apply. Codex's `workspace-write`
 sandbox probably blocks the CLI's network access, so an allowed review may need
-`full_access`. The opencode sandbox mounts `/` read-only, so `~/.coderabbit` stays
-readable unless it is added to `RINGER_SANDBOX_HIDE`.
+`full_access`. On Linux the opencode sandbox always hides `~/.coderabbit` (Boyd's decision,
+2026-11-03), so a sandboxed opencode worker cannot use the machine's CodeRabbit
+sign-in. On macOS the CLI keeps the sign-in in the Keychain, which the sandbox does
+not block (not tested on a Mac). A Codex worker has no such guard.

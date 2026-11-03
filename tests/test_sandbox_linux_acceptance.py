@@ -125,6 +125,110 @@ class OpencodeWrapperLinuxTests(unittest.TestCase):
         self.assertNotIn("THE-ANSWER", r.stdout + r.stderr)
         self.assertNotIn("answer.txt", r.stdout)
 
+    def test_coderabbit_folder_hidden_by_default(self):
+        cr = self.home / ".coderabbit"
+        cr.mkdir()
+        (cr / "auth.json").write_text("CR-SIGN-IN\n")
+        r = self.run_wrapped(f"cat '{cr}/auth.json'; ls -A '{cr}'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("CR-SIGN-IN", r.stdout + r.stderr)
+        self.assertNotIn("auth.json", r.stdout)
+
+    def test_coderabbit_folder_symlink_hidden(self):
+        real = self.home / "elsewhere" / "cr"
+        real.mkdir(parents=True)
+        (real / "auth.json").write_text("CR-SIGN-IN\n")
+        (self.home / ".coderabbit").symlink_to(real)
+        r = self.run_wrapped(f"cat '{self.home}/.coderabbit/auth.json'; cat '{real}/auth.json'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("CR-SIGN-IN", r.stdout + r.stderr)
+
+    def test_no_coderabbit_folder_still_runs(self):
+        r = self.run_wrapped(f"echo ok > '{self.taskdir}/r.md'")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cr = self.home / ".coderabbit"
+        self.assertTrue(cr.is_dir())
+        self.assertEqual(list(cr.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(cr.stat().st_mode), 0o700)
+
+    def test_coderabbit_sign_in_made_during_run_hidden(self):
+        # Real homes have opencode's state dirs, so no copy of HOME is mounted.
+        (self.home / ".local" / "share" / "opencode").mkdir(parents=True)
+        (self.home / ".local" / "state" / "opencode").mkdir(parents=True)
+        cr = self.home / ".coderabbit"
+
+        errors = []
+
+        def sign_in():
+            try:
+                for _ in range(100):
+                    if cr.is_dir():
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.5)
+                (cr / "auth.json").write_text("CR-SIGN-IN\n")
+            except Exception as exc:  # reported after join
+                errors.append(exc)
+
+        t = threading.Thread(target=sign_in)
+        t.start()
+        r = self.run_wrapped(f"sleep 3; cat '{cr}/auth.json'; echo done")
+        t.join()
+        self.assertEqual(errors, [])
+        self.assertTrue((cr / "auth.json").exists())
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("CR-SIGN-IN", r.stdout + r.stderr)
+
+    def test_coderabbit_target_ending_in_newline_hidden(self):
+        real = self.home / "cr\n"
+        real.mkdir()
+        (real / "auth.json").write_text("CR-SIGN-IN\n")
+        (self.home / ".coderabbit").symlink_to(real)
+        r = self.run_wrapped(f"cat \"$HOME/.coderabbit/auth.json\"; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("CR-SIGN-IN", r.stdout + r.stderr)
+
+    def test_coderabbit_regular_file_reads_empty(self):
+        (self.home / ".coderabbit").write_text("CR-SIGN-IN\n")
+        r = self.run_wrapped(f"cat '{self.home}/.coderabbit'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("CR-SIGN-IN", r.stdout + r.stderr)
+
+    def test_parallel_starts_create_coderabbit_folder_once(self):
+        results = []
+
+        def one():
+            results.append(self.run_wrapped("echo ran"))
+
+        threads = [threading.Thread(target=one) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(results), 6)
+        for r in results:
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ran", r.stdout)
+
+    def test_coderabbit_link_to_home_or_task_parent_refuses(self):
+        for target in (self.home, self.taskdir.parent, Path("/")):
+            with self.subTest(target=str(target)):
+                link = self.home / ".coderabbit"
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(target)
+                r = self.run_wrapped("echo ran")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertNotIn("ran", r.stdout)
+                self.assertIn("refusing to run", r.stderr)
+
+    def test_coderabbit_dangling_symlink_refuses(self):
+        (self.home / ".coderabbit").symlink_to(self.home / "missing")
+        r = self.run_wrapped("echo ran")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("ran", r.stdout)
+        self.assertIn("refusing to run", r.stderr)
+
     def test_session_bus_unreachable(self):
         uid = os.getuid()
         bus = Path(f"/run/user/{uid}/bus")

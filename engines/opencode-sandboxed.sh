@@ -513,6 +513,55 @@ while [ -n "$remaining" ]; do
   esac
 done
 
+# Always hide the CodeRabbit CLI's folder (Boyd's decision, 2026-11-03). The
+# sandbox shares the network. When no keyring is available, the CLI keeps its
+# sign-in in that folder (auth.json), so a worker could run a review in Boyd's
+# name. If the folder is missing, create it empty first: a folder created
+# during the run would otherwise be visible. Hide the resolved path: bwrap
+# cannot mount on a symlink, and Seatbelt checks resolved paths. The printf
+# keeps a trailing newline in the path. Known gaps (refute pass, 2026-11-03):
+# - the folder replaced on the host during the run (rename or delete and
+#   create) drops the Linux mount;
+# - files in the folder that are symlinks stay readable at their target;
+# - Linux: the keyring is out of reach only because the session bus socket is
+#   not reachable; a bus on an abstract socket would be reachable;
+# - macOS: the CLI keeps the sign-in in the Keychain, which this profile does
+#   not block. Not tested on a Mac.
+coderabbit_dir="$HOME/.coderabbit"
+# Workers that start at once may race to create it; the loser finds it made.
+if [ ! -e "$coderabbit_dir" ] && [ ! -L "$coderabbit_dir" ]; then
+  mkdir -m 700 -- "$coderabbit_dir" 2>/dev/null || [ -d "$coderabbit_dir" ] || {
+    echo "[ringer-sandbox] cannot create $coderabbit_dir to hide it; refusing to run" >&2
+    exit 1
+  }
+fi
+coderabbit_real=""
+if [ -d "$coderabbit_dir" ]; then
+  coderabbit_real="$(cd -P -- "$coderabbit_dir" && pwd -P && printf .)" || coderabbit_real=""
+elif [ -f "$coderabbit_dir" ]; then
+  coderabbit_real="$(readlink -f -- "$coderabbit_dir" && printf .)" || coderabbit_real=""
+fi
+coderabbit_real="${coderabbit_real%.}"
+coderabbit_real="${coderabbit_real%$'\n'}"
+case "$coderabbit_real" in
+  /*) ;;
+  *) echo "[ringer-sandbox] cannot resolve $coderabbit_dir to hide it; refusing to run" >&2
+     exit 1 ;;
+esac
+# The hide mounts come after the task and scratch binds, so a folder that is
+# HOME, or holds the task or scratch dir, would empty them. Refuse it.
+coderabbit_bad=
+[ "$coderabbit_real" = / ] && coderabbit_bad=1
+for coderabbit_keep in "$HOME" "$TASKDIR" "${TMPDIR:-/tmp}"; do
+  coderabbit_keep="$(cd -P -- "$coderabbit_keep" 2>/dev/null && pwd -P)" || continue
+  case "$coderabbit_keep/" in "$coderabbit_real"/*) coderabbit_bad=1 ;; esac
+done
+if [ -n "$coderabbit_bad" ]; then
+  echo "[ringer-sandbox] $coderabbit_dir resolves to HOME or a folder that holds the task or scratch dir; refusing to run" >&2
+  exit 1
+fi
+HIDDEN_PATHS+=("$coderabbit_real")
+
 case "$OS" in
   Darwin) run_darwin "$@" ;;
   Linux) run_linux "$@" ;;
