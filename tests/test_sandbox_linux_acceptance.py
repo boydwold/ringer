@@ -229,6 +229,138 @@ class OpencodeWrapperLinuxTests(unittest.TestCase):
         self.assertNotIn("ran", r.stdout)
         self.assertIn("refusing to run", r.stderr)
 
+    # Login keys and the key agent (Boyd's decision on board item 2421,
+    # 2026-11-03): a worker must not log in to another computer and back.
+    # Every key and agent here is fake.
+    def fake_agent(self, path: Path) -> socket.socket:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(path))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+        return srv
+
+    def agent_probe(self, path: str) -> str:
+        return (
+            f"{PY} -c \"import socket\n"
+            "s=socket.socket(socket.AF_UNIX)\n"
+            "try:\n s.connect('" + path + "'); print('AGENT-REACHED')\n"
+            "except OSError as e:\n print('agent-unreachable', e.errno)\n\"; echo done"
+        )
+
+    def test_ssh_folder_hidden_by_default(self):
+        ssh = self.home / ".ssh"
+        ssh.mkdir(mode=0o700)
+        (ssh / "id_fake").write_text("FAKE-SSH-KEY\n")
+        (ssh / "config").write_text("Host fake\n")
+        r = self.run_wrapped(f"cat '{ssh}/id_fake'; ls -A '{ssh}'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("FAKE-SSH-KEY", r.stdout + r.stderr)
+        self.assertNotIn("id_fake", r.stdout)
+        self.assertNotIn("config", r.stdout)
+
+    def test_ssh_folder_symlink_hidden(self):
+        real = self.home / "dotfiles-ssh"
+        real.mkdir(mode=0o700)
+        (real / "id_fake").write_text("FAKE-SSH-KEY\n")
+        (self.home / ".ssh").symlink_to(real)
+        r = self.run_wrapped(f"cat '{self.home}/.ssh/id_fake'; cat '{real}/id_fake'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("FAKE-SSH-KEY", r.stdout + r.stderr)
+
+    def test_no_ssh_folder_still_runs(self):
+        r = self.run_wrapped("echo ran")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ran", r.stdout)
+        ssh = self.home / ".ssh"
+        self.assertTrue(ssh.is_dir())
+        self.assertEqual(stat.S_IMODE(ssh.stat().st_mode), 0o700)
+
+    def test_ssh_link_to_home_refuses(self):
+        (self.home / ".ssh").symlink_to(self.home)
+        r = self.run_wrapped("echo ran")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("ran", r.stdout)
+        self.assertIn("refusing to run", r.stderr)
+
+    def test_agent_socket_in_ssh_folder_unreachable(self):
+        sock = self.home / ".ssh" / "agent.sock"
+        self.fake_agent(sock)
+        r = self.run_wrapped(self.agent_probe(str(sock)))
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertIn("agent-unreachable", r.stdout)
+        self.assertNotIn("AGENT-REACHED", r.stdout)
+
+    def test_agent_socket_named_by_ssh_auth_sock_unreachable(self):
+        # Outside ~/.ssh, /tmp and /run/user, which are hidden anyway.
+        sock = self.home / "agent-elsewhere" / "agent.sock"
+        self.fake_agent(sock)
+        r = self.run_wrapped(self.agent_probe(str(sock)) + "; echo \"sock=[$SSH_AUTH_SOCK]\"",
+                             extra_env={"SSH_AUTH_SOCK": str(sock)})
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertIn("agent-unreachable", r.stdout)
+        self.assertNotIn("AGENT-REACHED", r.stdout)
+        self.assertIn("sock=[]", r.stdout)
+
+    def test_ssh_auth_sock_in_ssh_folder_unreachable(self):
+        for rel in (".ssh/agent.sock", ".ssh/agent/s.x"):
+            with self.subTest(rel=rel):
+                sock = self.home / rel
+                self.fake_agent(sock)
+                r = self.run_wrapped(self.agent_probe(str(sock)), extra_env={"SSH_AUTH_SOCK": str(sock)})
+                self.assertIn("agent-unreachable", r.stdout, r.stderr)
+                self.assertNotIn("AGENT-REACHED", r.stdout)
+
+    def test_ssh_auth_sock_symlink_unreachable(self):
+        sock = self.home / "agent-elsewhere" / "agent.sock"
+        self.fake_agent(sock)
+        link = self.home / "agent-link.sock"
+        link.symlink_to(sock)
+        r = self.run_wrapped(self.agent_probe(str(link)) + "; " + self.agent_probe(str(sock)),
+                             extra_env={"SSH_AUTH_SOCK": str(link)})
+        self.assertEqual(r.stdout.count("agent-unreachable"), 2, r.stdout + r.stderr)
+        self.assertNotIn("AGENT-REACHED", r.stdout)
+
+    def test_other_agents_unreachable(self):
+        for rel in (".1password/agent.sock", ".gnupg/S.gpg-agent.ssh", ".bitwarden-ssh-agent.sock"):
+            with self.subTest(rel=rel):
+                sock = self.home / rel
+                self.fake_agent(sock)
+                r = self.run_wrapped(self.agent_probe(str(sock)))
+                self.assertIn("agent-unreachable", r.stdout, r.stderr)
+                self.assertNotIn("AGENT-REACHED", r.stdout)
+
+    def test_gpg_keys_hidden(self):
+        keys = self.home / ".gnupg" / "private-keys-v1.d"
+        keys.mkdir(parents=True)
+        (keys / "ABC.key").write_text("FAKE-GPG-KEY\n")
+        r = self.run_wrapped(f"cat '{keys}/ABC.key'; echo done")
+        self.assertIn("done", r.stdout, r.stderr)
+        self.assertNotIn("FAKE-GPG-KEY", r.stdout + r.stderr)
+
+    def test_missing_other_agent_folders_not_created(self):
+        r = self.run_wrapped("echo ran")
+        self.assertIn("ran", r.stdout, r.stderr)
+        self.assertFalse((self.home / ".1password").exists())
+        self.assertFalse((self.home / ".gnupg").exists())
+
+    def test_tailscale_control_socket_unreachable(self):
+        sock = Path("/run/tailscale/tailscaled.sock")
+        if not sock.is_socket():
+            self.skipTest("no Tailscale daemon on this host")
+        # Connect only, send nothing: outside the sandbox this must work.
+        probe = self.agent_probe(str(sock))
+        outside = subprocess.run(["sh", "-c", probe], capture_output=True, text=True, timeout=30)
+        self.assertIn("AGENT-REACHED", outside.stdout, outside.stderr)
+        r = self.run_wrapped(probe)
+        self.assertIn("agent-unreachable", r.stdout, r.stderr)
+        self.assertNotIn("AGENT-REACHED", r.stdout)
+
+    def test_ssh_auth_sock_not_a_socket_still_runs(self):
+        r = self.run_wrapped("echo ran", extra_env={"SSH_AUTH_SOCK": str(self.home / "missing.sock")})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ran", r.stdout)
+
     def test_session_bus_unreachable(self):
         uid = os.getuid()
         bus = Path(f"/run/user/{uid}/bus")

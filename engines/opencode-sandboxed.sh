@@ -228,16 +228,32 @@ cat > "$PROFILE" <<'SBEOF'
 ; name is not denied either.
 (deny file-read* file-write*
   (regex #"/opencode/service[^/]*\.json$"))
+; The ssh key agent that macOS starts for the desktop session listens on
+; /private/tmp/com.apple.launchd.<id>/Listeners. With it, a worker could log
+; in to another computer and from there back to this one, outside the sandbox
+; (Boyd's decision on board item 2421, 2026-11-03). Deny connecting to it,
+; even when SSH_AUTH_SOCK does not name it. Hidden folders and the agent that
+; SSH_AUTH_SOCK names are denied below.
+(deny network-outbound
+  (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$"))
 SBEOF
 
 # Only generated integer names enter profile text; paths remain -D parameters.
 HIDE_ARGS=()
 hide_index=0
 for hidden in ${HIDDEN_PATHS[@]+"${HIDDEN_PATHS[@]}"}; do
+  # A file rule does not cover connecting to a socket, so deny that too.
   printf '(deny file-read* (subpath (param "HIDE_%d")))\n' "$hide_index" >> "$PROFILE"
+  printf '(deny network-outbound (subpath (param "HIDE_%d")))\n' "$hide_index" >> "$PROFILE"
   HIDE_ARGS+=(-D "HIDE_$hide_index=$hidden")
   hide_index=$((hide_index + 1))
 done
+
+if [ -n "$AGENT_SOCK" ]; then
+  printf '(deny network-outbound (literal (param "AGENT_SOCK")))\n' >> "$PROFILE"
+  HIDE_ARGS+=(-D "AGENT_SOCK=$AGENT_SOCK")
+fi
+unset SSH_AUTH_SOCK
 
 export TMPDIR="$SCRATCH"
 export XDG_CACHE_HOME="$SCRATCH/cache"
@@ -486,10 +502,25 @@ with os.fdopen(fd, "w", encoding="ascii") as f:
   for hidden in "${HIDDEN_PATHS[@]}"; do
     if [ -d "$hidden" ]; then
       args+=(--tmpfs "$hidden")
-    elif [ -f "$hidden" ]; then
+    elif [ -f "$hidden" ] || [ -S "$hidden" ]; then
       args+=(--ro-bind /dev/null "$hidden")
     fi
   done
+  # The Tailscale daemon's control socket. Boyd's user is the Tailscale
+  # operator, so through it a worker could turn on Tailscale's own ssh
+  # server and log in with no key (refute pass, 2026-11-03). Workers do not
+  # need it; the network itself still works.
+  local tailscale_sock
+  for tailscale_sock in /run/tailscale/tailscaled.sock /var/run/tailscale/tailscaled.sock; do
+    tailscale_sock="$(readlink -f -- "$tailscale_sock" 2>/dev/null)" || continue
+    if [ -S "$tailscale_sock" ]; then
+      args+=(--ro-bind /dev/null "$tailscale_sock")
+    fi
+  done
+  # bwrap mounts /dev/null over the agent socket, so a connect is refused.
+  if [ -n "$AGENT_SOCK" ] && [ -S "$AGENT_SOCK" ]; then
+    args+=(--ro-bind /dev/null "$AGENT_SOCK")
+  fi
   args+=(--unshare-pid --unshare-ipc --die-with-parent --new-session
     --chdir "$TASKDIR_REAL"
     --unsetenv DBUS_SESSION_BUS_ADDRESS --unsetenv SSH_AUTH_SOCK
@@ -535,13 +566,54 @@ while [ -n "$remaining" ]; do
   esac
 done
 
-# Always hide the CodeRabbit CLI's folder (Boyd's decision, 2026-11-03). The
-# sandbox shares the network. When no keyring is available, the CLI keeps its
-# sign-in in that folder (auth.json), so a worker could run a review in Boyd's
-# name. If the folder is missing, create it empty first: a folder created
-# during the run would otherwise be visible. Hide the resolved path: bwrap
-# cannot mount on a symlink, and Seatbelt checks resolved paths. The printf
-# keeps a trailing newline in the path. Known gaps (refute pass, 2026-11-03):
+# Always hide a folder in HOME, at its resolved path: bwrap cannot mount on a
+# symlink, and Seatbelt checks resolved paths. If the folder is missing,
+# create it empty first: a folder created during the run would otherwise be
+# visible. The printf keeps a trailing newline in the path. The hide mounts
+# come after the task and scratch binds, so a folder that is HOME, or holds
+# the task or scratch dir, would empty them; refuse it.
+always_hide() {
+  local dir="$1" real keep bad=
+  # "if-present": skip a path that does not exist, instead of creating it.
+  if [ "${2:-}" = if-present ] && [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    return 0
+  fi
+  # Workers that start at once may race to create it; the loser finds it made.
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || {
+      echo "[ringer-sandbox] cannot create $dir to hide it; refusing to run" >&2
+      exit 1
+    }
+  fi
+  real=""
+  if [ -d "$dir" ]; then
+    real="$(cd -P -- "$dir" && pwd -P && printf .)" || real=""
+  elif [ -f "$dir" ] || [ -S "$dir" ]; then
+    real="$(readlink -f -- "$dir" && printf .)" || real=""
+  fi
+  real="${real%.}"
+  real="${real%$'\n'}"
+  case "$real" in
+    /*) ;;
+    *) echo "[ringer-sandbox] cannot resolve $dir to hide it; refusing to run" >&2
+       exit 1 ;;
+  esac
+  [ "$real" = / ] && bad=1
+  for keep in "$HOME" "$TASKDIR" "${TMPDIR:-/tmp}"; do
+    keep="$(cd -P -- "$keep" 2>/dev/null && pwd -P)" || continue
+    case "$keep/" in "$real"/*) bad=1 ;; esac
+  done
+  if [ -n "$bad" ]; then
+    echo "[ringer-sandbox] $dir resolves to HOME or a folder that holds the task or scratch dir; refusing to run" >&2
+    exit 1
+  fi
+  HIDDEN_PATHS+=("$real")
+}
+
+# The CodeRabbit CLI's folder (Boyd's decision, 2026-11-03). The sandbox
+# shares the network. When no keyring is available, the CLI keeps its sign-in
+# in that folder (auth.json), so a worker could run a review in Boyd's name.
+# Known gaps (refute pass, 2026-11-03):
 # - the folder replaced on the host during the run (rename or delete and
 #   create) drops the Linux mount;
 # - files in the folder that are symlinks stay readable at their target;
@@ -549,40 +621,44 @@ done
 #   not reachable; a bus on an abstract socket would be reachable;
 # - macOS: the CLI keeps the sign-in in the Keychain, not in this folder. The
 #   Seatbelt profile denies the Keychain services (see run_darwin).
-coderabbit_dir="$HOME/.coderabbit"
-# Workers that start at once may race to create it; the loser finds it made.
-if [ ! -e "$coderabbit_dir" ] && [ ! -L "$coderabbit_dir" ]; then
-  mkdir -m 700 -- "$coderabbit_dir" 2>/dev/null || [ -d "$coderabbit_dir" ] || {
-    echo "[ringer-sandbox] cannot create $coderabbit_dir to hide it; refusing to run" >&2
-    exit 1
-  }
+always_hide "$HOME/.coderabbit"
+
+# The login keys and the key agent (Boyd's decision on board item 2421,
+# 2026-11-03). The sandbox shares the network, so with a key a worker could
+# log in to the other computer and from there back to this one, outside the
+# sandbox. Hide ~/.ssh, which holds the keys, the ssh settings and, on klipsch,
+# the agent's socket. The agent that SSH_AUTH_SOCK names is made unreachable
+# too (see run_linux and run_darwin). Workers do not use git or ssh over the
+# network (Ringer fetches on the host). Side effects: with commit signing
+# through the ssh agent turned on, `git commit` inside a worker fails, so a
+# worker cannot sign with Boyd's key; and a dangling symlink or a FIFO at any
+# path listed here stops every worker ("cannot resolve").
+# Known gaps (refute passes, 2026-11-03):
+# - a key or agent socket in a place not listed here and not named by
+#   SSH_AUTH_SOCK, for example one that only an IdentityAgent line names;
+# - a key outside ~/.ssh that a symlink inside it points to;
+# - Linux: abstract unix sockets (such as 1Password's @1PASSWORD_* ones)
+#   stay reachable, because the sandbox shares the network namespace;
+# - a hard link to an agent socket made before the run;
+# - an "if-present" path that is missing when the run starts and is created
+#   during it (for example 1Password or Bitwarden started mid-run);
+# - Linux: an agent socket or the Tailscale socket that is deleted and made
+#   again during the run (an agent or tailscaled restart) is reachable, and
+#   so is a daemon that starts after the worker; deleting a file removes the
+#   mount on it. Seatbelt checks the path, so macOS is not affected;
+# - the same folder-replacement gap as for ~/.coderabbit.
+always_hide "$HOME/.ssh"
+# Other ssh agents and keys (refute pass, 2026-11-03): the 1Password agent
+# (klipsch has ~/.1password/agent.sock), gpg's keys and its ssh agent, and
+# Bitwarden's agent. These are hidden only if they exist.
+always_hide "$HOME/.1password" if-present
+always_hide "$HOME/.gnupg" if-present
+always_hide "$HOME/.bitwarden-ssh-agent.sock" if-present
+always_hide "$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t" if-present
+AGENT_SOCK=""
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+  AGENT_SOCK="$(readlink -f -- "$SSH_AUTH_SOCK")" || AGENT_SOCK=""
 fi
-coderabbit_real=""
-if [ -d "$coderabbit_dir" ]; then
-  coderabbit_real="$(cd -P -- "$coderabbit_dir" && pwd -P && printf .)" || coderabbit_real=""
-elif [ -f "$coderabbit_dir" ]; then
-  coderabbit_real="$(readlink -f -- "$coderabbit_dir" && printf .)" || coderabbit_real=""
-fi
-coderabbit_real="${coderabbit_real%.}"
-coderabbit_real="${coderabbit_real%$'\n'}"
-case "$coderabbit_real" in
-  /*) ;;
-  *) echo "[ringer-sandbox] cannot resolve $coderabbit_dir to hide it; refusing to run" >&2
-     exit 1 ;;
-esac
-# The hide mounts come after the task and scratch binds, so a folder that is
-# HOME, or holds the task or scratch dir, would empty them. Refuse it.
-coderabbit_bad=
-[ "$coderabbit_real" = / ] && coderabbit_bad=1
-for coderabbit_keep in "$HOME" "$TASKDIR" "${TMPDIR:-/tmp}"; do
-  coderabbit_keep="$(cd -P -- "$coderabbit_keep" 2>/dev/null && pwd -P)" || continue
-  case "$coderabbit_keep/" in "$coderabbit_real"/*) coderabbit_bad=1 ;; esac
-done
-if [ -n "$coderabbit_bad" ]; then
-  echo "[ringer-sandbox] $coderabbit_dir resolves to HOME or a folder that holds the task or scratch dir; refusing to run" >&2
-  exit 1
-fi
-HIDDEN_PATHS+=("$coderabbit_real")
 
 case "$OS" in
   Darwin) run_darwin "$@" ;;
