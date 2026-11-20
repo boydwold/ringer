@@ -1,3 +1,7 @@
+# Restrict task data labels to providers allowed by this Markdown rule.
+# [data_rule]
+# path = "~/vault/Notes/models/data-rule.md"
+
 # Sample config for ringer.py.
 # Copy to ~/.config/ringer/config.toml or pass with --config /path/to/config.toml.
 
@@ -83,6 +87,8 @@ jsonl_path = "~/.ringer/runs.jsonl"
 # env_file = "~/.supabase.env"
 
 [engines.codex]
+# Provider name in the data rule (codex is the built-in default).
+# provider = "codex"
 # Public default resolves this with shutil.which("codex"). Set an absolute path
 # here only for machine-specific installs.
 bin = "codex"

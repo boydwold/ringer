@@ -71,6 +71,7 @@ CODEX_RECONNECT_RE = re.compile(r"^ERROR: Reconnecting\.\.\. \d+/\d+\s*$")
 # The run state file's format. Readers outside Ringer refuse a version they do
 # not know, so bump this whenever a field they read changes meaning or shape.
 STATE_VERSION = 2
+DATA_LABELS = ("personal", "work-code", "customer")
 # A manifest may carry `meta` (run level and per task): an opaque JSON object that
 # Ringer copies into the run state untouched, so outside tools can link a work
 # order to where it came from. Capped so a manifest cannot bloat the state file.
@@ -767,6 +768,7 @@ class EngineConfig:
     failure_patterns: tuple[tuple[str, tuple[str, ...]], ...] = ()
     token_aggregate: str = "last"
     cost_regex: str | None = None
+    provider: str = ""
 
     @property
     def process_name(self) -> str:
@@ -1181,6 +1183,7 @@ class AppConfig:
     # Repos where a task with the coderabbit-code-review worker skill may run
     # the CodeRabbit CLI ([worker_skills] coderabbit_cli_repos). Empty by default.
     worker_skill_cli_repos: tuple[Path, ...] = ()
+    data_rule_path: Path | None = None
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1196,6 +1199,14 @@ class AppConfig:
         elif explicit:
             raise ValueError(f"config file not found: {config_path}")
 
+        data_rule = data.get("data_rule", {})
+        if not isinstance(data_rule, dict):
+            raise ValueError("data_rule must be a TOML table")
+        data_rule_path = None
+        if "path" in data_rule:
+            if not isinstance(data_rule["path"], str):
+                raise ValueError("data_rule.path must be a string")
+            data_rule_path = Path(data_rule["path"]).expanduser()
         state_dir = expand_path(data.get("state_dir"), default_state_dir())
         dashboard_port_base = int(data.get("dashboard_port_base", DEFAULT_DASHBOARD_PORT_BASE))
         if dashboard_port_base <= 0:
@@ -1224,6 +1235,7 @@ class AppConfig:
         return cls(
             path=config_path if config_path.exists() else None,
             identity_default=identity_default,
+            data_rule_path=data_rule_path,
             state_dir=state_dir,
             dashboard_port_base=dashboard_port_base,
             hud_port=hud_port,
@@ -1655,6 +1667,7 @@ def built_in_codex_engine() -> EngineConfig:
         token_regex=DEFAULT_TOKEN_REGEX,
         model_report_regex=DEFAULT_CODEX_MODEL_REPORT_REGEX,
         failure_profile="codex",
+        provider="codex",
     )
 
 
@@ -1785,6 +1798,9 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         if not clean_name:
             raise ValueError("engine name must not be empty")
         base = engines.get(clean_name)
+        provider = section.get("provider", base.provider if base else "")
+        if not isinstance(provider, str):
+            raise ValueError(f"engines.{clean_name}.provider must be a string")
         default_bin = base.bin if base else clean_name
         bin_path = str(section.get("bin", default_bin)).strip()
         if not bin_path:
@@ -1864,6 +1880,7 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             failure_patterns.append((failure_class, tuple(patterns)))
         engines[clean_name] = EngineConfig(
             name=clean_name,
+            provider=provider.strip(),
             bin=bin_path,
             args_template=args_template,
             full_access_args=full_access_args,
@@ -1924,6 +1941,7 @@ class TaskSpec:
     # engine's {model} placeholder); empty means the engine's model_default.
     model: str = ""
     task_type: str = ""
+    data: str = ""
     # Worker skills (see WORKER_SKILL_FILES) whose text is added to the spec
     # by apply_worker_skills before the run starts.
     skills: tuple[str, ...] = ()
@@ -1989,6 +2007,14 @@ class TaskSpec:
         task_type = obj.get("task_type", "")
         if not isinstance(task_type, str):
             raise ValueError(f"task {key}: task_type must be a string")
+        data = obj.get("data", "")
+        if not isinstance(data, str):
+            raise ValueError(f"task {key}: data must be a string")
+        data = data.strip()
+        if data and data not in DATA_LABELS:
+            raise ValueError(
+                f"task {key}: data must be one of personal, work-code, customer (got '{data}')"
+            )
         skills = obj.get("skills", [])
         if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
             raise ValueError(f"task {key}: skills must be a list of strings")
@@ -2013,6 +2039,7 @@ class TaskSpec:
             verified=verified.strip(),
             model=model.strip(),
             task_type=task_type.strip(),
+            data=data,
             skills=tuple(dict.fromkeys(skills)),
             meta=parse_meta(obj.get("meta"), f"task {key}"),
         )
@@ -2814,6 +2841,7 @@ class StateWriter:
                     "status": runtime.status,
                     "verdict": runtime.final_verdict,
                     "engine": runtime.task.engine,
+                    "data": runtime.task.data,
                     "model": (
                         runtime.task.model
                         or (engine.model_default if engine else "")
@@ -11002,6 +11030,83 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+def parse_data_rule(text: str) -> dict[str, frozenset[str]]:
+    start = "<!-- data-rule:start -->"
+    end = "<!-- data-rule:end -->"
+    if start not in text or end not in text.split(start, 1)[1]:
+        raise ValueError("missing data-rule:start or data-rule:end marker")
+    table = text.split(start, 1)[1].split(end, 1)[0]
+    rows = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in table.splitlines() if line.strip().startswith("|")
+    ]
+    header = rows[0] if rows else []
+    for column in ("provider", *DATA_LABELS):
+        if column not in header:
+            raise ValueError(f"data rule header missing {column}")
+    rule = {}
+    for row in rows[1:]:
+        if all(re.fullmatch(r":?-+:?", cell) for cell in row):
+            continue
+        cells = dict(zip(header, row))
+        provider = cells.get("provider", "")
+        allowed = set()
+        for label in DATA_LABELS:
+            value = cells.get(label, "")
+            if value.lower() not in {"yes", "no"}:
+                raise ValueError(f"provider {provider}: invalid {label} value {value!r}")
+            if value.lower() == "yes":
+                allowed.add(label)
+        rule[provider] = frozenset(allowed)
+    return rule
+
+
+def validate_manifest_data(manifest: Manifest, config: AppConfig) -> None:
+    path = config.data_rule_path
+    if path is None:
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read the data rule at {path}: {exc}") from exc
+    try:
+        rule = parse_data_rule(text)
+    except ValueError as exc:
+        raise ValueError(f"data rule {path}: {exc}") from exc
+    problems = []
+    for task in manifest.tasks:
+        engine = config.engines.get(task.engine)
+        if engine is None:
+            continue
+        if not task.data:
+            problems.append(
+                f'task {task.key}: no "data" label. Set "data" to one of '
+                'personal, work-code, customer. Ringer does not guess a label.'
+            )
+        if not engine.provider:
+            problems.append(
+                f"task {task.key}: engine {task.engine} has no provider. Set "
+                f"engines.{task.engine}.provider in config.toml to a provider named in the data rule."
+            )
+        elif engine.provider not in rule:
+            problems.append(
+                f"task {task.key}: engine {task.engine} uses provider {engine.provider}, "
+                "which the data rule does not list, so it is allowed for no data."
+            )
+        elif task.data and task.data not in rule[engine.provider]:
+            allowed = sorted(
+                name for name, candidate in config.engines.items()
+                if task.data in rule.get(candidate.provider, frozenset())
+            )
+            problems.append(
+                f"task {task.key}: engine {task.engine} (provider {engine.provider}) "
+                f"may not see {task.data} data. Engines allowed for {task.data}: "
+                f"{', '.join(allowed) or 'none'}."
+            )
+    if problems:
+        raise ValueError(f"refused by the data rule ({path}):\n" + "\n".join(problems))
+
+
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
     missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
     if missing:
@@ -11586,6 +11691,7 @@ def one_request_manifest(
     reasoning_effort: str,
     model: str | None,
     redact: bool,
+    data: str | None = None,
 ) -> Manifest:
     engine_args: list[str] = []
     if engine == DEFAULT_ENGINE_NAME:
@@ -11618,6 +11724,7 @@ def one_request_manifest(
                     "that the answer is correct"
                 ),
                 task_type="one-request",
+                data=data or "",
             ),
         ),
     )
@@ -11720,8 +11827,10 @@ def run_one_request(config: AppConfig, args: argparse.Namespace) -> int:
         reasoning_effort=args.reasoning_effort,
         model=args.model,
         redact=args.redact,
+        data=args.data,
     )
     validate_manifest_engines(manifest, config)
+    validate_manifest_data(manifest, config)
     preflight_engine_bins(manifest, config)
     identity = resolve_identity(
         args.identity,
@@ -12791,6 +12900,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"worker engine (default: {DEFAULT_ENGINE_NAME})",
     )
     ask_parser.add_argument("--model", help="Codex model override")
+    ask_parser.add_argument("--data", choices=DATA_LABELS, default=None, help="data label for the request")
     ask_parser.add_argument(
         "--reasoning-effort",
         choices=("minimal", "low", "medium", "high"),
@@ -13039,6 +13149,7 @@ def main(argv: list[str] | None = None) -> int:
         if any(finding.startswith("ERROR:") for finding in lint_findings):
             return 1
         validate_manifest_engines(manifest, config)
+        validate_manifest_data(manifest, config)
         identity_start_paths = [manifest.workdir]
         if manifest.source_path is not None:
             identity_start_paths.append(manifest.source_path.parent)
