@@ -287,6 +287,15 @@ class SandboxMarkerPositionTests(unittest.TestCase):
         out = "[ringer.py] attempt 1 started\n[ringer-sandbox] bwrap not found\n"
         self.assertEqual(self._case(out)[0], "harness_error")
 
+    def test_wrapper_info_note_first_is_not_a_harness_error(self):
+        # The mac-ollama bake-off (2026-11-19): the wrapper printed an info line,
+        # the worker exited 0, and the check failed on the model's code.
+        out = ("[ringer.py] attempt 1 started\n"
+               "[ringer-sandbox-note] OPENCODE_CONFIG is set; not adding provider keys from auth.json\n"
+               '{"type":"text","part":{"text":"Fixed parse_duration"}}\n'
+               "[ringer.py] attempt 1 exited rc=0\n")
+        self.assertEqual(self._case(out)[0], "model")
+
 
 class OpencodeDatabaseLockedTests(unittest.TestCase):
     """Real opencode output from a 2026-10-09 audition run with two parallel workers."""

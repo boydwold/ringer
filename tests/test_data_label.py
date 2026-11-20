@@ -42,6 +42,7 @@ RULE = textwrap.dedent(
     | mac-local | yes | yes | yes | Ollama on the Mac |
     | gemini-agy | yes | no | no | Gemini through agy |
     | bedrock | no | yes | yes | Bedrock |
+    | openrouter | yes | yes | no | OpenRouter |
     <!-- data-rule:end -->
 
     | codex | yes | yes | yes | a table outside the markers is ignored |
@@ -55,10 +56,16 @@ LONG_SPEC = (
 CHECK = "test -s output.txt || { echo 'FAIL: output.txt missing'; exit 1; }"
 
 
-def task(key: str, engine: str, data: str | None) -> TaskSpec:
+def task(
+    key: str, engine: str, data: str | None, *, model: str = "", engine_args: list[str] | None = None
+) -> TaskSpec:
     obj = {"key": key, "spec": LONG_SPEC, "check": CHECK, "engine": engine}
     if data is not None:
         obj["data"] = data
+    if model:
+        obj["model"] = model
+    if engine_args is not None:
+        obj["engine_args"] = engine_args
     return TaskSpec.from_obj(obj)
 
 
@@ -109,6 +116,19 @@ class DataRuleTestCase(unittest.TestCase):
             sandbox_args = []
             full_access_args = []
 
+            [engines.opencode]
+            bin = "/bin/true"
+            provider = "openrouter"
+            model_default = "openrouter/qwen/qwen3-coder"
+            args_template = ["{{model}}", "{{spec}}"]
+            sandbox_args = []
+            full_access_args = []
+            safe_engine_args = ["--variant=*"]
+
+            [engines.opencode.model_providers]
+            openrouter = "openrouter"
+            opencode = "opencode-zen"
+
             [engines.noprovider]
             bin = "/bin/true"
             args_template = ["{{spec}}"]
@@ -140,7 +160,7 @@ class ParseDataRuleTests(DataRuleTestCase):
         self.assertEqual(rule["mac-local"], frozenset({"personal", "work-code", "customer"}))
         self.assertEqual(rule["gemini-agy"], frozenset({"personal"}))
         self.assertEqual(rule["bedrock"], frozenset({"work-code", "customer"}))
-        self.assertEqual(set(rule), {"codex", "mac-local", "gemini-agy", "bedrock"})
+        self.assertEqual(set(rule), {"codex", "mac-local", "gemini-agy", "bedrock", "openrouter"})
 
     def test_missing_markers_is_an_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "data-rule:start"):
@@ -249,5 +269,63 @@ class ValidateManifestDataTests(DataRuleTestCase):
         validate_manifest_data(manifest(task("a", "noprovider", None)), self.config(rule_line=""))
 
 
+
+class ModelAndArgsTests(DataRuleTestCase):
+    """The provider follows the model and the flags, not only the engine name."""
+
+    def test_model_prefix_picks_the_provider(self) -> None:
+        validate_manifest_data(
+            manifest(task("o", "opencode", "work-code", model="openrouter/openai/gpt-oss-120b")),
+            self.config(),
+        )
+
+    def test_default_model_prefix_is_checked_too(self) -> None:
+        validate_manifest_data(manifest(task("d", "opencode", "work-code")), self.config())
+
+    def test_model_on_a_provider_outside_the_rule_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "opencode-zen"):
+            validate_manifest_data(
+                manifest(task("z", "opencode", "work-code", model="opencode/big-pickle")),
+                self.config(),
+            )
+
+    def test_model_with_an_unknown_prefix_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prefix"):
+            validate_manifest_data(
+                manifest(task("x", "opencode", "personal", model="somecloud/model")),
+                self.config(),
+            )
+
+    def test_engine_args_are_refused_unless_the_engine_marks_them_safe(self) -> None:
+        with self.assertRaisesRegex(ValueError, "engine_args"):
+            validate_manifest_data(
+                manifest(task("c", "codex", "work-code", engine_args=["--oss"])),
+                self.config(),
+            )
+
+    def test_engine_args_that_match_a_safe_pattern_pass(self) -> None:
+        validate_manifest_data(
+            manifest(task("v", "opencode", "work-code", engine_args=["--variant=high"])),
+            self.config(),
+        )
+
+    def test_one_unsafe_arg_among_safe_ones_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--model=openrouter/x"):
+            validate_manifest_data(
+                manifest(task("m", "opencode", "work-code",
+                              engine_args=["--variant=high", "--model=openrouter/x"])),
+                self.config(),
+            )
+
+    def test_duplicate_provider_row_is_an_error(self) -> None:
+        text = RULE.replace(
+            "| bedrock | no | yes | yes | Bedrock |",
+            "| bedrock | no | yes | yes | Bedrock |\n| codex | yes | yes | yes | again |",
+        )
+        with self.assertRaisesRegex(ValueError, "codex"):
+            parse_data_rule(text)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -89,6 +89,13 @@ jsonl_path = "~/.ringer/runs.jsonl"
 [engines.codex]
 # Provider name in the data rule (codex is the built-in default).
 # provider = "codex"
+# A flag in a task's engine_args can send the data to another provider (for
+# example codex --oss). With a data rule on, every engine_args item must match
+# one of these fnmatch patterns, or the task is refused.
+# safe_engine_args = ["-c", "model_reasoning_effort=*"]
+# A harness that reaches several providers names the provider by the model's
+# prefix (text before the first "/"). A model with another prefix is refused.
+# [engines.opencode] model_providers = { openrouter = "openrouter", opencode = "opencode-zen" }
 # Public default resolves this with shutil.which("codex"). Set an absolute path
 # here only for machine-specific installs.
 bin = "codex"

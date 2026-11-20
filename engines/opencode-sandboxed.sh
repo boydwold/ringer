@@ -346,7 +346,7 @@ run_linux() {
   # OPENCODE_CONFIG is kept as it is.
   if [ -f "$OC_SHARE/auth.json" ]; then
     if [ -n "${OPENCODE_CONFIG:-}" ]; then
-      echo "[ringer-sandbox] OPENCODE_CONFIG is set; not adding provider keys from auth.json" >&2
+      echo "[ringer-sandbox-note] OPENCODE_CONFIG is set; not adding provider keys from auth.json" >&2
     else
       local keys_file="$SCRATCH/ringer-provider-keys.json"
       local keys_status=0

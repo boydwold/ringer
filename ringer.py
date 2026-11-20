@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import fnmatch
 import json
 import mimetypes
 import os
@@ -769,6 +770,12 @@ class EngineConfig:
     token_aggregate: str = "last"
     cost_regex: str | None = None
     provider: str = ""
+    # Data rule: when set, the model's prefix (text before the first "/")
+    # names the provider, because one harness can reach several providers.
+    model_providers: tuple[tuple[str, str], ...] = ()
+    # Data rule: fnmatch patterns a task's engine_args must match. A flag can
+    # send the data to another provider, so anything else is refused.
+    safe_engine_args: tuple[str, ...] = ()
 
     @property
     def process_name(self) -> str:
@@ -1801,6 +1808,20 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         provider = section.get("provider", base.provider if base else "")
         if not isinstance(provider, str):
             raise ValueError(f"engines.{clean_name}.provider must be a string")
+        raw_model_providers = section.get(
+            "model_providers", dict(base.model_providers) if base else {}
+        )
+        if not isinstance(raw_model_providers, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw_model_providers.items()
+        ):
+            raise ValueError(f"engines.{clean_name}.model_providers must be a table of strings")
+        model_providers = tuple(
+            sorted((k.strip(), v.strip()) for k, v in raw_model_providers.items())
+        )
+        safe_engine_args = as_string_tuple(
+            section.get("safe_engine_args", list(base.safe_engine_args) if base else []),
+            key=f"engines.{clean_name}.safe_engine_args",
+        )
         default_bin = base.bin if base else clean_name
         bin_path = str(section.get("bin", default_bin)).strip()
         if not bin_path:
@@ -1881,6 +1902,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         engines[clean_name] = EngineConfig(
             name=clean_name,
             provider=provider.strip(),
+            model_providers=model_providers,
+            safe_engine_args=safe_engine_args,
             bin=bin_path,
             args_template=args_template,
             full_access_args=full_access_args,
@@ -11057,6 +11080,8 @@ def parse_data_rule(text: str) -> dict[str, frozenset[str]]:
                 raise ValueError(f"provider {provider}: invalid {label} value {value!r}")
             if value.lower() == "yes":
                 allowed.add(label)
+        if provider in rule:
+            raise ValueError(f"provider {provider} has more than one row")
         rule[provider] = frozenset(allowed)
     return rule
 
@@ -11083,23 +11108,45 @@ def validate_manifest_data(manifest: Manifest, config: AppConfig) -> None:
                 f'task {task.key}: no "data" label. Set "data" to one of '
                 'personal, work-code, customer. Ringer does not guess a label.'
             )
-        if not engine.provider:
+        unsafe = [
+            arg for arg in task.engine_args
+            if not any(fnmatch.fnmatchcase(arg, pattern) for pattern in engine.safe_engine_args)
+        ]
+        if unsafe:
+            problems.append(
+                f"task {task.key}: engine_args {' '.join(unsafe)} may send the data to another "
+                f"provider. Add a pattern to engines.{task.engine}.safe_engine_args, or make a "
+                "separate engine with its own provider."
+            )
+        provider = engine.provider
+        if engine.model_providers:
+            model = task.model or engine.model_default
+            prefix = model.split("/", 1)[0] if "/" in model else ""
+            mapped = dict(engine.model_providers).get(prefix)
+            if mapped is None:
+                problems.append(
+                    f"task {task.key}: model {model or '(none)'} has no prefix that "
+                    f"engines.{task.engine}.model_providers names, so its provider is unknown."
+                )
+                continue
+            provider = mapped
+        if not provider:
             problems.append(
                 f"task {task.key}: engine {task.engine} has no provider. Set "
                 f"engines.{task.engine}.provider in config.toml to a provider named in the data rule."
             )
-        elif engine.provider not in rule:
+        elif provider not in rule:
             problems.append(
-                f"task {task.key}: engine {task.engine} uses provider {engine.provider}, "
+                f"task {task.key}: engine {task.engine} uses provider {provider}, "
                 "which the data rule does not list, so it is allowed for no data."
             )
-        elif task.data and task.data not in rule[engine.provider]:
+        elif task.data and task.data not in rule[provider]:
             allowed = sorted(
                 name for name, candidate in config.engines.items()
                 if task.data in rule.get(candidate.provider, frozenset())
             )
             problems.append(
-                f"task {task.key}: engine {task.engine} (provider {engine.provider}) "
+                f"task {task.key}: engine {task.engine} (provider {provider}) "
                 f"may not see {task.data} data. Engines allowed for {task.data}: "
                 f"{', '.join(allowed) or 'none'}."
             )

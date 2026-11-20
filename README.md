@@ -106,7 +106,7 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `expect_files` | Files that must exist and be non-empty before the check runs |
 | `engine` | Which configured engine runs this task (default `codex`) |
 | `model` | Which model a harness engine runs for this task — fills the engine's `{model}` placeholder (e.g. `"openrouter/moonshotai/kimi-k2.7"`); empty uses the engine's `model_default` |
-| `data` | Optional label (`personal`, `work-code`, or `customer`), required when a data rule is configured to restrict which providers may see task data. |
+| `data` | Optional label (`personal`, `work-code`, or `customer`), required when a data rule is configured to restrict which providers may see task data. The check uses the engine's `provider`, or the provider that `model_providers` names for the model's prefix. With a data rule on, every `engine_args` item must match the engine's `safe_engine_args`. |
 | `task_type` | Optional free-form string naming the kind of work this task is, so the model-performance log can slice pass rates by task shape rather than only by model. Suggested vocabulary: `code-feature`, `code-fix`, `code-review`, `test-hardening`, `docs`, `research`, `persona-review`, `copywriting`, `site-build`, `motion-design`, `image-gen`, `data-pipeline`, `format-conversion`, `probe`, `bakeoff`. Empty is allowed; the log just reports it under `(none)`. |
 | `timeout_s` | Per-task kill timer for the worker (default 900) |
 | `check_timeout_s` | Per-task kill timer for the `check` command (default 60). Raise it when the check must run something genuinely slow; the timeout message names this field and lands in the retry prompt |
