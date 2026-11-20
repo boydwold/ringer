@@ -7442,7 +7442,7 @@ def noncanonical_route_findings(
 ) -> list[str]:
     identity_registry = registry or load_model_identity_registry()
     findings: list[str] = []
-    for task in manifest.tasks:
+    for task in tasks_with_fallbacks(manifest):
         engine = config.engines.get(task.engine) if config is not None else None
         model_key = task.model or (engine.model_default if engine is not None else "")
         if not model_key:
@@ -10144,7 +10144,9 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                fallback = fallback_task(runtime.task)
+                # A sandbox refusal comes from the task's own setup (a path
+                # outside the writable root), so another engine meets it too.
+                fallback = fallback_task(runtime.task) if failure_class != "sandbox_denied" else None
                 if fallback is not None:
                     # Any failure on the first engine (a failed check, a
                     # timeout, an engine that does not answer) hands the task

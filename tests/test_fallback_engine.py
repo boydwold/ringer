@@ -266,5 +266,27 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task_state["fallback_from"], "mac-ollama")
         self.assertEqual(task_state["engine"], "codex")
 
+    async def test_sandbox_refusal_does_not_fall_back(self):
+        runner, runtime = self.runner_for(task(fallback_engine="codex", max_attempts=1))
+        engines = self.script(runner, runtime, ["a", "b"], [False, True])
+
+        def classify(*args, **kwargs):
+            return ("sandbox_denied", "path outside the writable root")
+
+        with patch.object(ringer, "classify_failure", classify), contextlib.redirect_stdout(io.StringIO()):
+            await runner._run_task(runtime)
+        self.assertEqual(engines, ["mac-ollama"])
+        self.assertEqual(runtime.status, "fail")
+        self.assertIsNone(runtime.fallback_from)
+
+    def test_lint_reads_the_fallback_route(self):
+        seen = []
+        registry = Mock(defaults={}, noncanonical_routes=Mock(get=lambda key: seen.append(key)))
+        ringer.noncanonical_route_findings(
+            manifest(self.root, task(fallback_engine="codex")), config=self.config, registry=registry
+        )
+        self.assertIn("codex", [engine for engine, _ in seen])
+
+
 if __name__ == "__main__":
     unittest.main()
