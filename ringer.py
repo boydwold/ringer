@@ -1968,6 +1968,10 @@ class TaskSpec:
     # Worker skills (see WORKER_SKILL_FILES) whose text is added to the spec
     # by apply_worker_skills before the run starts.
     skills: tuple[str, ...] = ()
+    # A second engine that takes over when an attempt on `engine` does not
+    # pass (see fallback_task). Empty means no fallback.
+    fallback_engine: str = ""
+    fallback_model: str = ""
     # Passed through to the run state untouched (see META_MAX_BYTES).
     meta: dict[str, Any] | None = field(default=None, compare=False, hash=False)
 
@@ -2041,6 +2045,18 @@ class TaskSpec:
         skills = obj.get("skills", [])
         if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
             raise ValueError(f"task {key}: skills must be a list of strings")
+        fallback_engine = obj.get("fallback_engine", "")
+        if not isinstance(fallback_engine, str):
+            raise ValueError(f"task {key}: fallback_engine must be a string (an engine name)")
+        fallback_engine = fallback_engine.strip()
+        if fallback_engine and fallback_engine == engine:
+            raise ValueError(f"task {key}: fallback_engine must differ from engine ({engine})")
+        fallback_model = obj.get("fallback_model", "")
+        if not isinstance(fallback_model, str):
+            raise ValueError(f"task {key}: fallback_model must be a string")
+        fallback_model = fallback_model.strip()
+        if fallback_model and not fallback_engine:
+            raise ValueError(f"task {key}: fallback_model is set but fallback_engine is not")
         unknown = sorted({item for item in skills if item not in WORKER_SKILL_FILES})
         if unknown:
             raise ValueError(
@@ -2064,8 +2080,43 @@ class TaskSpec:
             task_type=task_type.strip(),
             data=data,
             skills=tuple(dict.fromkeys(skills)),
+            fallback_engine=fallback_engine,
+            fallback_model=fallback_model,
             meta=parse_meta(obj.get("meta"), f"task {key}"),
         )
+
+
+def fallback_task(task: TaskSpec) -> TaskSpec | None:
+    """The task as the fallback engine runs it, or None without a fallback.
+
+    The first engine's model and engine_args belong to that engine, so the
+    fallback runs its own default model unless fallback_model names one.
+    """
+    if not task.fallback_engine:
+        return None
+    return dataclass_replace(
+        task,
+        engine=task.fallback_engine,
+        model=task.fallback_model,
+        engine_args=(),
+        fallback_engine="",
+        fallback_model="",
+    )
+
+
+def tasks_with_fallbacks(manifest: "Manifest") -> list[TaskSpec]:
+    """Every task, plus each fallback as a task keyed "<key> (fallback)".
+
+    The engine, data-rule and binary checks run over this list, so a fallback
+    engine passes the same checks as a first engine before any worker starts.
+    """
+    out = []
+    for task in manifest.tasks:
+        out.append(task)
+        fallback = fallback_task(task)
+        if fallback is not None:
+            out.append(dataclass_replace(fallback, key=f"{task.key} (fallback)"))
+    return out
 
 
 @dataclass(frozen=True)
@@ -2553,6 +2604,8 @@ class TaskRuntime:
     steering: dict[str, Any] | None = None
     model_attempts: int = 0
     infra_retries: int = 0
+    # The first engine's name once the fallback engine has taken over.
+    fallback_from: str | None = None
     end_reason: str | None = None
     wait_reason: str | None = None
     wait_s: float | None = None
@@ -2902,6 +2955,7 @@ class StateWriter:
                     "attempts": runtime.attempts,
                     "model_attempts": runtime.model_attempts,
                     "infra_retries": runtime.infra_retries,
+                    "fallback_from": runtime.fallback_from,
                     "end_reason": runtime.end_reason,
                     "wait_reason": runtime.wait_reason,
                     "wait_s": runtime.wait_s,
@@ -10090,6 +10144,31 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
+                fallback = fallback_task(runtime.task)
+                if fallback is not None:
+                    # Any failure on the first engine (a failed check, a
+                    # timeout, an engine that does not answer) hands the task
+                    # to the fallback engine at once, with no provider wait.
+                    # The fallback gets its own model and infra budgets, and
+                    # the same failure context as a normal retry.
+                    failure_context = build_failure_context(worker.output_tail, verify.raw_output_excerpt)
+                    current_spec = (
+                        f"{runtime.task.spec}\n\n"
+                        f"Previous attempt (engine {runtime.task.engine}) failed: {failure_context}. Fix it."
+                    )
+                    print(
+                        f"{runtime.task.key} failed on {runtime.task.engine} ({failure_class}); "
+                        f"falling back to {fallback.engine}",
+                        flush=True,
+                    )
+                    with self.lock:
+                        runtime.fallback_from = runtime.task.engine
+                        runtime.task = fallback
+                        runtime.model_attempts = 0
+                        runtime.infra_retries = 0
+                    delay = min(self.config.retry.infra_max_delay_s, self.config.retry.infra_base_delay_s)
+                    retrying = True
+                    continue
                 if (
                     failure_class in INFRA_TRANSIENT_CLASSES
                     and runtime.infra_retries < self.config.retry.infra_max
@@ -11036,7 +11115,7 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
     "worker spawn failed: [Errno 2]" in the task log — the least helpful
     possible first experience.
     """
-    for name in sorted({task.engine for task in manifest.tasks}):
+    for name in sorted({task.engine for task in tasks_with_fallbacks(manifest)}):
         engine = config.engines.get(name)
         if engine is None:
             continue  # validate_manifest_engines already rejected this
@@ -11099,7 +11178,7 @@ def validate_manifest_data(manifest: Manifest, config: AppConfig) -> None:
     except ValueError as exc:
         raise ValueError(f"data rule {path}: {exc}") from exc
     problems = []
-    for task in manifest.tasks:
+    for task in tasks_with_fallbacks(manifest):
         engine = config.engines.get(task.engine)
         if engine is None:
             continue
@@ -11155,10 +11234,11 @@ def validate_manifest_data(manifest: Manifest, config: AppConfig) -> None:
 
 
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
-    missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
+    checked = tasks_with_fallbacks(manifest)
+    missing = sorted({task.engine for task in checked if task.engine not in config.engines})
     if missing:
         raise ValueError(f"unknown worker engine(s): {', '.join(missing)}")
-    for task in manifest.tasks:
+    for task in checked:
         engine = config.engines[task.engine]
         requires_model = any("{model}" in item for item in engine.args_template)
         accepts_model = requires_model or "{model_args}" in engine.args_template
